@@ -1,0 +1,15 @@
+[submodule "services/document-processing-layer"]
+	path = services/document-processing-layer
+	url = https://github.com/taite-ang-saiyin/document-processing-layer
+[submodule "services/visual-field-detection"]
+	path = services/visual-field-detection
+	url = https://github.com/minsett7/visual-field-detection
+[submodule "services/ocr-fastapi-service"]
+	path = services/ocr-fastapi-service
+	url = https://github.com/HninSu-15/ocr-fastapi-service
+[submodule "services/insurance-claim-ui"]
+	path = services/insurance-claim-ui
+	url = https://github.com/minsett7/Insurance-Claim-Form-OCR-Frontend-and-Backend.git
+[submodule "services/insurance-vlm"]
+	path = services/insurance-vlm
+	url = https://github.com/Shinn-koe/Insurance-VLM

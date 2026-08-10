@@ -1,0 +1,45 @@
+.git
+.gitmodules
+.env
+.env.*
+!.env.example
+**/.git
+**/.env
+**/.env.*
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.coverage
+**/htmlcov
+**/.venv
+**/venv
+**/node_modules
+**/dist
+
+# Runtime insurance data and generated outputs must never enter a build context.
+**/runtime
+**/runtime_data
+**/data
+**/artifacts
+**/uploads
+**/jobs
+**/storage
+**/exports
+**/crops
+
+# Models remain external volume mounts.
+**/models
+**/models_weights
+**/*.bin
+**/*.gguf
+**/*.onnx
+**/*.pt
+**/*.pth
+**/*.safetensors
+
+# Root-context images only need the orchestrator, adapters, VLM, UI, and mocks.
+services/document-processing-layer
+services/ocr-fastapi-service
+services/visual-field-detection
+
+# Local caches and editor metadata.

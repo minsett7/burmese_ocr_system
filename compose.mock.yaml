@@ -1,0 +1,75 @@
+name: unified-insurance-platform-mock
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: insurance_platform
+      POSTGRES_USER: insurance_platform
+      POSTGRES_PASSWORD: mock-test-password
+    volumes:
+      - mock_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U insurance_platform -d insurance_platform"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+    networks: [platform]
+
+  mock-downstreams:
+    build:
+      context: .
+      dockerfile: docker/mock-services.Dockerfile
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [platform]
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: docker/orchestrator.Dockerfile
+    environment:
+      DATABASE_URL: postgresql://insurance_platform:mock-test-password@postgres:5432/insurance_platform
+      ORCHESTRATOR_STORAGE_ROOT: /data/artifacts
+      DOCUMENT_PROCESSING_URL: http://mock-downstreams:8000
+      VISUAL_FIELD_URL: http://mock-downstreams:8000
+      OCR_URL: http://mock-downstreams:8000
+      INSURANCE_VLM_URL: http://mock-downstreams:8000
+      VLM_API_KEY: mock-key
+      VLM_POLL_INTERVAL_SECONDS: 0.05
+      VLM_POLL_TIMEOUT_SECONDS: 10
+      REQUEST_TIMEOUT_SECONDS: 10
+      RETRY_ATTEMPTS: 2
+    volumes:
+      - mock_artifacts:/data/artifacts
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mock-downstreams:
+        condition: service_healthy
+    networks: [platform]
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+      args:
+        VITE_API_BASE_URL: .
+    ports:
+      - "3000:80"
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    networks: [platform]
+
+networks:
+  platform:
+
+volumes:
+  mock_postgres_data:
+  mock_artifacts:
