@@ -97,84 +97,52 @@ class WorkflowService:
                 message="Creating and assessing the canonical template page.",
             )
             visual_id = visual_document["document_id"]
-            if not await self._preprocess_registration(record, visual_id, correlation_id):
+            canonical_page = await self._preprocess_registration(record, visual_id, correlation_id)
+            if canonical_page is None:
                 return
+            page_bytes, identity = canonical_page
 
             self._template_progress(
                 record,
-                "detect_regions",
+                "layout_and_ocr",
                 38,
                 status="extracting",
-                message="Capture accepted; detecting layout regions.",
+                message="Running layout detection and printed-label OCR in parallel.",
             )
-            await self.client.request(
-                "visual-field-detection",
-                "POST",
-                f"{self.settings.visual_field_url}/v1/documents/{visual_id}/extract",
-                correlation_id=correlation_id,
-                json={"detect_table_cells": True},
+            record["layout_status"] = "running"
+            record["ocr_status"] = "running"
+            record["updated_at"] = iso_now()
+            self.store.put("registration", registration_id, record)
+
+            layout_task = asyncio.create_task(
+                self._run_layout_branch(record, visual_id, correlation_id)
             )
-            layout_response = (
-                await self.client.request(
-                    "visual-field-detection",
-                    "GET",
-                    f"{self.settings.visual_field_url}/v1/documents/{visual_id}/result",
-                    correlation_id=correlation_id,
-                )
-            ).json()
+            ocr_task = asyncio.create_task(
+                self._run_ocr_branch(record, page_bytes, correlation_id)
+            )
+            branch_results = await asyncio.gather(
+                layout_task,
+                ocr_task,
+                return_exceptions=True,
+            )
+            for branch_result in branch_results:
+                if isinstance(branch_result, Exception):
+                    raise branch_result
+            layout_response, ocr_response = branch_results
             if len(layout_response.get("pages", [])) != 1:
                 raise AdapterError("Template registration currently supports exactly one page")
-            layout_page = layout_response["pages"][0]
-            image_path = layout_page.get("image_path")
-            if not image_path:
-                raise AdapterError("Visual-field result did not identify the canonical page artifact")
-            page_response = await self.client.request(
-                "visual-field-detection",
-                "GET",
-                f"{self.settings.visual_field_url}/v1/documents/{visual_id}/artifacts/{image_path}",
-                correlation_id=correlation_id,
-            )
-            page_bytes = page_response.content
-            canonical_path = self.settings.storage_root / registration_id / "page_001.png"
-            canonical_path.write_bytes(page_bytes)
 
             self._template_progress(
                 record,
-                "ocr",
-                55,
-                status="extracting",
-                message="Reading printed labels.",
-            )
-            ocr_response = (
-                await self.client.request(
-                    "ocr-fastapi-service",
-                    "POST",
-                    f"{self.settings.ocr_url}/v1/ocr/process",
-                    correlation_id=correlation_id,
-                    params={"preprocess_mode": "minimal", "language": "eng+mya"},
-                    files={"file": ("page_001.png", page_bytes, "image/png")},
-                )
-            ).json()
-
-            identity = ImageIdentity.from_bytes(
-                page_bytes,
-                document_id=visual_id,
-                page_id=str(layout_page.get("page_id", "page_001")),
-                page_number=int(layout_page.get("page_number", 1)),
+                "contract_validation",
+                60,
+                status="contract_validation",
+                message="Validating canonical identity, geometry, and downstream contracts.",
             )
             ocr_contract, layout_contract, adapter_warnings = build_vlm_contracts(
                 ocr_response, layout_response, identity
             )
-            record["image_identity"] = {
-                "sha256": identity.sha256,
-                "width": identity.width,
-                "height": identity.height,
-                "document_id": identity.document_id,
-                "page_id": identity.page_id,
-                "page_number": identity.page_number,
-            }
             record["adapter_warnings"] = adapter_warnings
-            record["page_images"] = [f"/api/v1/template-registrations/{registration_id}/pages/1"]
             record["layout_contract"] = layout_contract
 
             self._template_progress(
@@ -243,7 +211,7 @@ class WorkflowService:
         record: dict[str, Any],
         visual_id: str,
         correlation_id: str,
-    ) -> bool:
+    ) -> tuple[bytes, ImageIdentity] | None:
         requested_policy = str(record.get("preprocessing", {}).get("requested_policy", "auto"))
         correction_mode = PREPROCESSING_MODES.get(requested_policy)
         if correction_mode is None:
@@ -297,29 +265,82 @@ class WorkflowService:
         record["updated_at"] = iso_now()
         self.store.put("registration", record["id"], record)
 
-        if not preprocessing["retake_required"]:
-            return True
+        if preprocessing["retake_required"]:
+            record["status"] = "needs_resubmission"
+            record["progress"] = {
+                "stage": "capture_quality",
+                "percent": 25,
+                "message": "The template image did not pass capture quality checks. Please upload a new image.",
+            }
+            record["updated_at"] = iso_now()
+            self.store.put("registration", record["id"], record)
+            self.store.add_audit(
+                action="template registration requires resubmission",
+                target_type="template_registration",
+                target_id=record["id"],
+                correlation_id=correlation_id,
+                after={
+                    "status": record["status"],
+                    "decision": preprocessing["decision"],
+                    "reasons": preprocessing["reasons"],
+                },
+            )
+            return None
 
-        record["status"] = "needs_resubmission"
-        record["progress"] = {
-            "stage": "capture_quality",
-            "percent": 25,
-            "message": "The template image did not pass capture quality checks. Please upload a new image.",
+        manifest_page = preprocess_manifest["pages"][0]
+        image_path = str(manifest_page.get("image_path") or "")
+        if not image_path or image_path.startswith("/") or ".." in Path(image_path).parts:
+            raise AdapterError("Preprocessing manifest did not identify a valid canonical page artifact")
+        page_response = await self.client.request(
+            "visual-field-detection",
+            "GET",
+            f"{self.settings.visual_field_url}/v1/documents/{visual_id}/artifacts/{image_path}",
+            correlation_id=correlation_id,
+        )
+        page_bytes = page_response.content
+        if not page_bytes:
+            raise AdapterError("Canonical page artifact is empty")
+
+        page_id = str(manifest_page.get("page_id") or "")
+        page_number = manifest_page.get("page_number")
+        if not page_id or page_number != 1:
+            raise AdapterError("Preprocessing manifest has an invalid canonical page identity")
+        identity = ImageIdentity.from_bytes(
+            page_bytes,
+            document_id=visual_id,
+            page_id=page_id,
+            page_number=page_number,
+        )
+        if manifest_page.get("sha256") != identity.sha256:
+            raise AdapterError("Canonical page SHA-256 does not match the preprocessing manifest")
+        if manifest_page.get("width") != identity.width or manifest_page.get("height") != identity.height:
+            raise AdapterError("Canonical page dimensions do not match the preprocessing manifest")
+
+        canonical_path = self.settings.storage_root / record["id"] / "page_001.png"
+        canonical_path.write_bytes(page_bytes)
+        record["image_identity"] = {
+            "sha256": identity.sha256,
+            "width": identity.width,
+            "height": identity.height,
+            "document_id": identity.document_id,
+            "page_id": identity.page_id,
+            "page_number": identity.page_number,
+        }
+        record["page_images"] = [f"/api/v1/template-registrations/{record['id']}/pages/1"]
+        record["canonical_artifact"] = {
+            "upstream_path": image_path,
+            "retrieved_at": iso_now(),
         }
         record["updated_at"] = iso_now()
         self.store.put("registration", record["id"], record)
         self.store.add_audit(
-            action="template registration requires resubmission",
+            action="established canonical template page",
             target_type="template_registration",
             target_id=record["id"],
             correlation_id=correlation_id,
-            after={
-                "status": record["status"],
-                "decision": preprocessing["decision"],
-                "reasons": preprocessing["reasons"],
-            },
+            after=record["image_identity"],
         )
-        return False
+        return page_bytes, identity
 
     @staticmethod
     def _build_preprocessing_result(
@@ -386,6 +407,8 @@ class WorkflowService:
             "pages": [
                 {
                     "page_id": page.get("page_id"),
+                    "page_number": page.get("page_number"),
+                    "image_path": page.get("image_path"),
                     "width": page.get("width"),
                     "height": page.get("height"),
                     "sha256": page.get("sha256"),
@@ -395,6 +418,67 @@ class WorkflowService:
                 for page in pages
             ],
         }
+
+    async def _run_layout_branch(
+        self,
+        record: dict[str, Any],
+        visual_id: str,
+        correlation_id: str,
+    ) -> dict[str, Any]:
+        try:
+            await self.client.request(
+                "visual-field-detection",
+                "POST",
+                f"{self.settings.visual_field_url}/v1/documents/{visual_id}/extract",
+                correlation_id=correlation_id,
+                json={"detect_table_cells": True},
+            )
+            result = (
+                await self.client.request(
+                    "visual-field-detection",
+                    "GET",
+                    f"{self.settings.visual_field_url}/v1/documents/{visual_id}/result",
+                    correlation_id=correlation_id,
+                )
+            ).json()
+        except Exception:
+            self._set_branch_status(record, "layout", "failed")
+            raise
+        self._set_branch_status(record, "layout", "complete")
+        return result
+
+    async def _run_ocr_branch(
+        self,
+        record: dict[str, Any],
+        page_bytes: bytes,
+        correlation_id: str,
+    ) -> dict[str, Any]:
+        try:
+            result = (
+                await self.client.request(
+                    "ocr-fastapi-service",
+                    "POST",
+                    f"{self.settings.ocr_url}/v1/ocr/process",
+                    correlation_id=correlation_id,
+                    params={"preprocess_mode": "minimal", "language": "eng+mya"},
+                    files={"file": ("page_001.png", page_bytes, "image/png")},
+                )
+            ).json()
+        except Exception:
+            self._set_branch_status(record, "ocr", "failed")
+            raise
+        self._set_branch_status(record, "ocr", "complete")
+        return result
+
+    def _set_branch_status(
+        self,
+        record: dict[str, Any],
+        branch: str,
+        status: str,
+    ) -> None:
+        record[f"{branch}_status"] = status
+        record["updated_at"] = iso_now()
+        self.store.put("registration", record["id"], record)
 
     async def _poll_vlm(self, job_id: str, correlation_id: str, headers: dict[str, str]) -> dict[str, Any]:
         loop = asyncio.get_running_loop()

@@ -225,6 +225,8 @@ def create_app(
                 "instructions": [],
                 "operations": [],
             },
+            "layout_status": "pending",
+            "ocr_status": "pending",
             "draft": None,
             "draft_revision": 0,
             "downstream_ids": {},

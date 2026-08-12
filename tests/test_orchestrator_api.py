@@ -38,6 +38,8 @@ class FakeDownstreams:
         self.retake_required = False
         self.quality_pass = True
         self.preprocessing_operations = ["exif_orientation", "rgb_conversion"]
+        self.fail_layout = False
+        self.fail_ocr = False
         self.requests: list[httpx.Request] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -102,11 +104,12 @@ class FakeDownstreams:
                     "quality_pass": self.quality_pass and capture_ready,
                     "pages": [
                         {
+                            "image_path": "preprocessed/pages/page_001.png",
                             "page_id": "page_001",
                             "page_number": 1,
                             "width": 100,
                             "height": 200,
-                            "sha256": "canonical-page-sha",
+                            "sha256": hashlib.sha256(self.page).hexdigest(),
                             "source_to_page_transform": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
                             "operations": self.preprocessing_operations,
                             "quality": {
@@ -118,6 +121,8 @@ class FakeDownstreams:
                 },
             )
         if method == "POST" and path.endswith("/extract"):
+            if self.fail_layout:
+                return httpx.Response(503, json={"detail": "layout unavailable"})
             return httpx.Response(200, json={"status": "extracted"})
         if method == "GET" and path.endswith("/result") and path.startswith("/v1/documents"):
             return httpx.Response(
@@ -143,6 +148,8 @@ class FakeDownstreams:
         if method == "GET" and "/artifacts/" in path:
             return httpx.Response(200, content=self.page, headers={"content-type": "image/png"})
         if method == "POST" and path == "/v1/ocr/process":
+            if self.fail_ocr:
+                return httpx.Response(503, json={"detail": "ocr unavailable"})
             return httpx.Response(
                 200,
                 json={
@@ -439,4 +446,87 @@ def test_none_policy_still_blocks_manifest_quality_failure(client):
     attempted = {(request.method, request.url.path) for request in fake.requests}
     assert ("POST", "/v1/documents/visual-doc/extract") not in attempted
     assert ("POST", "/v1/ocr/process") not in attempted
+    assert ("POST", "/api/v1/registrations") not in attempted
+
+
+def test_canonical_page_is_established_before_layout_and_ocr(client):
+    test_client, fake = client
+
+    response = test_client.post(
+        "/api/v1/template-registrations",
+        data={"form_type_id": "motor", "preprocessing_policy": "auto"},
+        files={"file": ("blank.png", fake.page, "image/png")},
+    )
+
+    assert response.status_code == 202, response.text
+    registration_id = response.json()["id"]
+    registration = test_client.get(
+        f"/api/v1/template-registrations/{registration_id}"
+    ).json()
+    expected_sha = hashlib.sha256(fake.page).hexdigest()
+    assert registration["status"] == "needs_approval"
+    assert registration["layout_status"] == "complete"
+    assert registration["ocr_status"] == "complete"
+    assert registration["image_identity"] == {
+        "sha256": expected_sha,
+        "width": 100,
+        "height": 200,
+        "document_id": "visual-doc",
+        "page_id": "page_001",
+        "page_number": 1,
+    }
+    assert registration["preprocessing"]["pages"][0]["image_path"] == (
+        "preprocessed/pages/page_001.png"
+    )
+    page_response = test_client.get(
+        f"/api/v1/template-registrations/{registration_id}/pages/1"
+    )
+    assert page_response.status_code == 200
+    assert page_response.content == fake.page
+
+    requests = [
+        (request.method, request.url.path)
+        for request in fake.requests
+    ]
+    canonical_index = requests.index(
+        ("GET", "/v1/documents/visual-doc/artifacts/preprocessed/pages/page_001.png")
+    )
+    layout_index = requests.index(("POST", "/v1/documents/visual-doc/extract"))
+    ocr_index = requests.index(("POST", "/v1/ocr/process"))
+    assert canonical_index < layout_index
+    assert canonical_index < ocr_index
+
+
+@pytest.mark.parametrize(
+    ("failed_branch", "failure_service"),
+    [
+        ("layout", "visual-field-detection"),
+        ("ocr", "ocr-fastapi-service"),
+    ],
+)
+def test_branch_failure_is_observable_and_prevents_vlm(
+    client,
+    failed_branch,
+    failure_service,
+):
+    test_client, fake = client
+    setattr(fake, f"fail_{failed_branch}", True)
+
+    response = test_client.post(
+        "/api/v1/template-registrations",
+        data={"form_type_id": "motor"},
+        files={"file": ("blank.png", fake.page, "image/png")},
+    )
+
+    assert response.status_code == 202, response.text
+    registration = test_client.get(
+        f"/api/v1/template-registrations/{response.json()['id']}"
+    ).json()
+    other_branch = "ocr" if failed_branch == "layout" else "layout"
+    assert registration["status"] == "failed"
+    assert registration[f"{failed_branch}_status"] == "failed"
+    assert registration[f"{other_branch}_status"] == "complete"
+    assert registration["failure"]["code"] == "DOWNSTREAM_ERROR"
+    assert registration["failure"]["service"] == failure_service
+    attempted = {(request.method, request.url.path) for request in fake.requests}
     assert ("POST", "/api/v1/registrations") not in attempted
