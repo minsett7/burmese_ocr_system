@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -34,8 +35,13 @@ class FakeDownstreams:
         self.registered_templates = []
         self.registered_references = []
         self.processed_documents = 0
+        self.retake_required = False
+        self.quality_pass = True
+        self.preprocessing_operations = ["exif_orientation", "rgb_conversion"]
+        self.requests: list[httpx.Request] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
         path = request.url.path
         method = request.method
         if path in {"/health", "/health/ready"}:
@@ -43,7 +49,74 @@ class FakeDownstreams:
         if method == "POST" and path == "/v1/documents":
             return httpx.Response(201, json={"document_id": "visual-doc", "status": "uploaded"})
         if method == "POST" and path.endswith("/preprocess"):
-            return httpx.Response(200, json={"status": "preprocessed"})
+            capture_ready = not self.retake_required
+            return httpx.Response(
+                200,
+                json={
+                    "document_id": "visual-doc",
+                    "status": "preprocessed",
+                    "artifact": "preprocessed/preprocess_manifest.json",
+                    "summary": {
+                        "page_count": 1,
+                        "quality_pass": self.quality_pass and capture_ready,
+                        "capture_profile": "template",
+                        "capture_ready": capture_ready,
+                        "retake_required": self.retake_required,
+                    },
+                },
+            )
+        if method == "GET" and path.endswith("/capture-assessment"):
+            capture_ready = not self.retake_required
+            reasons = ["image_too_blurry"] if self.retake_required else []
+            instructions = ["Hold still, tap to focus and capture again."] if self.retake_required else []
+            return httpx.Response(
+                200,
+                json={
+                    "document_id": "visual-doc",
+                    "capture_profile": "template",
+                    "capture_ready": capture_ready,
+                    "retake_required": self.retake_required,
+                    "pages": [
+                        {
+                            "page_id": "page_001",
+                            "status": "retake_required" if self.retake_required else "ready",
+                            "capture_ready": capture_ready,
+                            "retake_required": self.retake_required,
+                            "reasons": reasons,
+                            "advisories": [],
+                            "instructions": instructions,
+                            "alignment": None,
+                        }
+                    ],
+                },
+            )
+        if method == "GET" and path.endswith("/artifacts/preprocessed/preprocess_manifest.json"):
+            capture_ready = not self.retake_required
+            return httpx.Response(
+                200,
+                json={
+                    "schema_version": "1.2.0",
+                    "capture_profile": "template",
+                    "capture_ready": capture_ready,
+                    "page_count": 1,
+                    "quality_pass": self.quality_pass and capture_ready,
+                    "pages": [
+                        {
+                            "page_id": "page_001",
+                            "page_number": 1,
+                            "width": 100,
+                            "height": 200,
+                            "sha256": "canonical-page-sha",
+                            "source_to_page_transform": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                            "operations": self.preprocessing_operations,
+                            "quality": {
+                                "quality_pass": self.quality_pass and capture_ready,
+                                "warnings": ["image_may_be_blurry"] if not self.quality_pass or self.retake_required else [],
+                            },
+                        }
+                    ],
+                },
+            )
         if method == "POST" and path.endswith("/extract"):
             return httpx.Response(200, json={"status": "extracted"})
         if method == "GET" and path.endswith("/result") and path.startswith("/v1/documents"):
@@ -251,3 +324,119 @@ def test_cors_same_origin_configuration(client):
     )
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
+
+@pytest.mark.parametrize(
+    ("policy", "correction_mode", "operations", "decision"),
+    [
+        ("none", "none", ["exif_orientation", "rgb_conversion"], "canonicalize_only"),
+        ("force", "standard", ["exif_orientation", "rgb_conversion", "mild_sharpening"], "correct"),
+    ],
+)
+def test_preprocessing_policy_is_mapped_and_decision_is_persisted(
+    client,
+    policy,
+    correction_mode,
+    operations,
+    decision,
+):
+    test_client, fake = client
+    fake.preprocessing_operations = operations
+    page = png_bytes()
+
+    response = test_client.post(
+        "/api/v1/template-registrations",
+        data={"form_type_id": "motor", "preprocessing_policy": policy},
+        files={"file": ("blank.png", page, "image/png")},
+    )
+
+    assert response.status_code == 202, response.text
+    registration = test_client.get(
+        f"/api/v1/template-registrations/{response.json()['id']}"
+    ).json()
+    assert registration["status"] == "needs_approval"
+    assert registration["source_sha256"] == hashlib.sha256(page).hexdigest()
+    assert registration["preprocessing"]["requested_policy"] == policy
+    assert registration["preprocessing"]["correction_mode"] == correction_mode
+    assert registration["preprocessing"]["decision"] == decision
+    preprocess_request = next(
+        request
+        for request in fake.requests
+        if request.method == "POST" and request.url.path.endswith("/preprocess")
+    )
+    assert json.loads(preprocess_request.content) == {
+        "correction_mode": correction_mode,
+        "capture_profile": "template",
+        "deskew": True,
+        "normalize_illumination": True,
+        "sharpen": True,
+    }
+
+
+def test_failed_capture_stops_before_layout_ocr_and_vlm(client):
+    test_client, fake = client
+    fake.retake_required = True
+
+    response = test_client.post(
+        "/api/v1/template-registrations",
+        data={"form_type_id": "motor", "preprocessing_policy": "auto"},
+        files={"file": ("blurry.png", png_bytes(), "image/png")},
+    )
+
+    assert response.status_code == 202, response.text
+    registration = test_client.get(
+        f"/api/v1/template-registrations/{response.json()['id']}"
+    ).json()
+    assert registration["status"] == "needs_resubmission"
+    assert registration["progress"]["stage"] == "capture_quality"
+    assert registration["failure"] is None
+    assert registration["preprocessing"]["decision"] == "reject_and_retake"
+    assert registration["preprocessing"]["capture_ready"] is False
+    assert registration["preprocessing"]["retake_required"] is True
+    assert "image_too_blurry" in registration["preprocessing"]["reasons"]
+    assert registration["preprocessing"]["instructions"]
+
+    attempted = {(request.method, request.url.path) for request in fake.requests}
+    assert ("POST", "/v1/documents/visual-doc/extract") not in attempted
+    assert ("POST", "/v1/ocr/process") not in attempted
+    assert ("POST", "/api/v1/registrations") not in attempted
+
+
+def test_invalid_preprocessing_policy_is_rejected(client):
+    test_client, fake = client
+
+    response = test_client.post(
+        "/api/v1/template-registrations",
+        data={"form_type_id": "motor", "preprocessing_policy": "aggressive"},
+        files={"file": ("blank.png", png_bytes(), "image/png")},
+    )
+
+    assert response.status_code == 422
+    assert "preprocessing_policy must be one of" in response.json()["detail"]
+    assert fake.requests == []
+
+def test_none_policy_still_blocks_manifest_quality_failure(client):
+    test_client, fake = client
+    fake.quality_pass = False
+
+    response = test_client.post(
+        "/api/v1/template-registrations",
+        data={"form_type_id": "motor", "preprocessing_policy": "none"},
+        files={"file": ("blurry-scanner.png", png_bytes(), "image/png")},
+    )
+
+    assert response.status_code == 202, response.text
+    registration = test_client.get(
+        f"/api/v1/template-registrations/{response.json()['id']}"
+    ).json()
+    preprocessing = registration["preprocessing"]
+    assert registration["status"] == "needs_resubmission"
+    assert preprocessing["requested_policy"] == "none"
+    assert preprocessing["quality_pass"] is False
+    assert preprocessing["capture_ready"] is False
+    assert preprocessing["retake_required"] is True
+    assert "image_may_be_blurry" in preprocessing["reasons"]
+
+    attempted = {(request.method, request.url.path) for request in fake.requests}
+    assert ("POST", "/v1/documents/visual-doc/extract") not in attempted
+    assert ("POST", "/v1/ocr/process") not in attempted
+    assert ("POST", "/api/v1/registrations") not in attempted

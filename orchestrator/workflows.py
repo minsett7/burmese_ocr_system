@@ -35,6 +35,20 @@ LAYOUT_FALLBACK_MODES = {
     "TABLE": "table",
     "TABLE_CELL": "table",
 }
+PREPROCESSING_MODES = {
+    "auto": "auto",
+    "force": "standard",
+    "none": "none",
+}
+
+CORRECTIVE_OPERATIONS = {
+    "perspective_crop",
+    "small_angle_deskew",
+    "illumination_normalization",
+    "mild_sharpening",
+    "autocontrast",
+    "grayscale",
+}
 
 
 class WorkflowService:
@@ -55,7 +69,13 @@ class WorkflowService:
         record = self.store.require("registration", registration_id)
         correlation_id = record["correlation_id"]
         try:
-            self._template_progress(record, "upload_layout", 8)
+            self._template_progress(
+                record,
+                "upload_validation",
+                8,
+                status="validating",
+                message="Creating the visual-service registration document.",
+            )
             source_path = Path(record["source_path"])
             source_bytes = source_path.read_bytes()
             media_type = mimetypes.guess_type(record["file_name"])[0] or "application/octet-stream"
@@ -69,17 +89,24 @@ class WorkflowService:
             visual_document = response.json()
             record["downstream_ids"]["visual_document_id"] = visual_document["document_id"]
 
-            self._template_progress(record, "preprocess", 22)
-            visual_id = visual_document["document_id"]
-            await self.client.request(
-                "visual-field-detection",
-                "POST",
-                f"{self.settings.visual_field_url}/v1/documents/{visual_id}/preprocess",
-                correlation_id=correlation_id,
-                json={"capture_profile": "template", "correction_mode": "auto"},
+            self._template_progress(
+                record,
+                "preprocessing",
+                18,
+                status="preprocessing",
+                message="Creating and assessing the canonical template page.",
             )
+            visual_id = visual_document["document_id"]
+            if not await self._preprocess_registration(record, visual_id, correlation_id):
+                return
 
-            self._template_progress(record, "detect_regions", 38)
+            self._template_progress(
+                record,
+                "detect_regions",
+                38,
+                status="extracting",
+                message="Capture accepted; detecting layout regions.",
+            )
             await self.client.request(
                 "visual-field-detection",
                 "POST",
@@ -111,7 +138,13 @@ class WorkflowService:
             canonical_path = self.settings.storage_root / registration_id / "page_001.png"
             canonical_path.write_bytes(page_bytes)
 
-            self._template_progress(record, "ocr", 55)
+            self._template_progress(
+                record,
+                "ocr",
+                55,
+                status="extracting",
+                message="Reading printed labels.",
+            )
             ocr_response = (
                 await self.client.request(
                     "ocr-fastapi-service",
@@ -144,7 +177,13 @@ class WorkflowService:
             record["page_images"] = [f"/api/v1/template-registrations/{registration_id}/pages/1"]
             record["layout_contract"] = layout_contract
 
-            self._template_progress(record, "semantic_mapping", 70)
+            self._template_progress(
+                record,
+                "semantic_mapping",
+                70,
+                status="vlm_queued",
+                message="Submitting validated contracts to Insurance-VLM.",
+            )
             vlm_headers = {"X-API-Key": self.settings.vlm_api_key} if self.settings.vlm_api_key else {}
             vlm_response = await self.client.request(
                 "insurance-vlm",
@@ -162,7 +201,13 @@ class WorkflowService:
             record["downstream_ids"]["vlm_job_id"] = vlm_job["job_id"]
             self.store.put("registration", registration_id, record)
 
-            self._template_progress(record, "vlm_poll", 82)
+            self._template_progress(
+                record,
+                "vlm_poll",
+                82,
+                status="vlm_running",
+                message="Insurance-VLM semantic mapping is running.",
+            )
             result = await self._poll_vlm(vlm_job["job_id"], correlation_id, vlm_headers)
             record["vlm_result"] = result
             record["draft"] = self._build_editable_draft(record, result, layout_contract)
@@ -192,6 +237,164 @@ class WorkflowService:
                 correlation_id=correlation_id,
                 after=record["failure"],
             )
+
+    async def _preprocess_registration(
+        self,
+        record: dict[str, Any],
+        visual_id: str,
+        correlation_id: str,
+    ) -> bool:
+        requested_policy = str(record.get("preprocessing", {}).get("requested_policy", "auto"))
+        correction_mode = PREPROCESSING_MODES.get(requested_policy)
+        if correction_mode is None:
+            raise ValueError(f"Unsupported preprocessing policy: {requested_policy}")
+
+        preprocess_response = await self.client.request(
+            "visual-field-detection",
+            "POST",
+            f"{self.settings.visual_field_url}/v1/documents/{visual_id}/preprocess",
+            correlation_id=correlation_id,
+            json={
+                "correction_mode": correction_mode,
+                "capture_profile": "template",
+                "deskew": True,
+                "normalize_illumination": True,
+                "sharpen": True,
+            },
+        )
+        preprocess_result = preprocess_response.json()
+        summary = preprocess_result.get("summary") or {}
+        if summary.get("page_count") != 1:
+            raise AdapterError("Template registration currently supports exactly one page")
+
+        capture_assessment = (
+            await self.client.request(
+                "visual-field-detection",
+                "GET",
+                f"{self.settings.visual_field_url}/v1/documents/{visual_id}/capture-assessment",
+                correlation_id=correlation_id,
+            )
+        ).json()
+        artifact_path = str(preprocess_result.get("artifact") or "")
+        if not artifact_path or artifact_path.startswith("/") or ".." in Path(artifact_path).parts:
+            raise AdapterError("Visual-field preprocessing did not return a valid manifest artifact")
+        preprocess_manifest = (
+            await self.client.request(
+                "visual-field-detection",
+                "GET",
+                f"{self.settings.visual_field_url}/v1/documents/{visual_id}/artifacts/{artifact_path}",
+                correlation_id=correlation_id,
+            )
+        ).json()
+
+        preprocessing = self._build_preprocessing_result(
+            requested_policy,
+            correction_mode,
+            preprocess_manifest,
+            capture_assessment,
+        )
+        record["preprocessing"] = preprocessing
+        record["updated_at"] = iso_now()
+        self.store.put("registration", record["id"], record)
+
+        if not preprocessing["retake_required"]:
+            return True
+
+        record["status"] = "needs_resubmission"
+        record["progress"] = {
+            "stage": "capture_quality",
+            "percent": 25,
+            "message": "The template image did not pass capture quality checks. Please upload a new image.",
+        }
+        record["updated_at"] = iso_now()
+        self.store.put("registration", record["id"], record)
+        self.store.add_audit(
+            action="template registration requires resubmission",
+            target_type="template_registration",
+            target_id=record["id"],
+            correlation_id=correlation_id,
+            after={
+                "status": record["status"],
+                "decision": preprocessing["decision"],
+                "reasons": preprocessing["reasons"],
+            },
+        )
+        return False
+
+    @staticmethod
+    def _build_preprocessing_result(
+        requested_policy: str,
+        correction_mode: str,
+        manifest: dict[str, Any],
+        assessment: dict[str, Any],
+    ) -> dict[str, Any]:
+        pages = manifest.get("pages") or []
+        if len(pages) != 1:
+            raise AdapterError("Template registration currently supports exactly one page")
+
+        assessment_pages = assessment.get("pages") or []
+        reasons = list(dict.fromkeys(
+            str(reason)
+            for page in assessment_pages
+            for reason in (page.get("reasons") or [])
+        ))
+        advisories = list(dict.fromkeys(
+            str(advisory)
+            for page in assessment_pages
+            for advisory in (page.get("advisories") or [])
+        ))
+        instructions = list(dict.fromkeys(
+            str(instruction)
+            for page in assessment_pages
+            for instruction in (page.get("instructions") or [])
+        ))
+        operations = list(dict.fromkeys(
+            str(operation)
+            for page in pages
+            for operation in (page.get("operations") or [])
+        ))
+        quality_pass = bool(manifest.get("quality_pass", False))
+        if not quality_pass:
+            quality_warnings = (
+                str(warning)
+                for page in pages
+                for warning in (page.get("quality", {}).get("warnings") or [])
+            )
+            reasons = list(dict.fromkeys([*reasons, *quality_warnings]))
+        capture_ready = bool(assessment.get("capture_ready", False)) and quality_pass
+        retake_required = bool(assessment.get("retake_required", False)) or not capture_ready
+        if retake_required:
+            decision = "reject_and_retake"
+        elif any(operation in CORRECTIVE_OPERATIONS for operation in operations):
+            decision = "correct"
+        else:
+            decision = "canonicalize_only"
+
+        return {
+            "requested_policy": requested_policy,
+            "correction_mode": correction_mode,
+            "decision": decision,
+            "capture_ready": capture_ready,
+            "retake_required": retake_required,
+            "reasons": reasons,
+            "advisories": advisories,
+            "instructions": instructions,
+            "operations": operations,
+            "quality_pass": quality_pass,
+            "capture_profile": manifest.get("capture_profile"),
+            "page_count": int(manifest.get("page_count", len(pages))),
+            "pages": [
+                {
+                    "page_id": page.get("page_id"),
+                    "width": page.get("width"),
+                    "height": page.get("height"),
+                    "sha256": page.get("sha256"),
+                    "source_to_page_transform": page.get("source_to_page_transform"),
+                    "quality": page.get("quality"),
+                }
+                for page in pages
+            ],
+        }
 
     async def _poll_vlm(self, job_id: str, correlation_id: str, headers: dict[str, str]) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
@@ -273,9 +476,19 @@ class WorkflowService:
             "quality_summary": result.get("quality_summary", {}),
         }
 
-    def _template_progress(self, record: dict[str, Any], stage: str, percent: int) -> None:
-        record["status"] = "analyzing"
+    def _template_progress(
+        self,
+        record: dict[str, Any],
+        stage: str,
+        percent: int,
+        *,
+        status: str = "analyzing",
+        message: str | None = None,
+    ) -> None:
+        record["status"] = status
         record["progress"] = {"stage": stage, "percent": percent}
+        if message:
+            record["progress"]["message"] = message
         record["updated_at"] = iso_now()
         self.store.put("registration", record["id"], record)
 

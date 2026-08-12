@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import logging
@@ -37,6 +38,7 @@ FORM_TYPES = [
     {"id": "motor", "name": "Motor", "label": "Motor Claim"},
     {"id": "fire", "name": "Fire", "label": "Fire Claim"},
 ]
+VALID_PREPROCESSING_POLICIES = {"auto", "force", "none"}
 VALID_FORM_TYPES = {item["id"] for item in FORM_TYPES}
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$")
 
@@ -184,10 +186,16 @@ def create_app(
         return {"status": "ok" if all(item["status"] == "available" for item in results.values()) else "degraded", "services": results}
 
     def create_registration_record(
-        *, content: bytes, filename: str, name: str, form_type_id: str, language: str, version_note: str | None, correlation_id: str
+        *, content: bytes, filename: str, name: str, form_type_id: str, language: str,
+        version_note: str | None, preprocessing_policy: str, correlation_id: str
     ) -> dict[str, Any]:
         if form_type_id not in VALID_FORM_TYPES:
             raise HTTPException(status_code=422, detail="unknown form_type_id")
+        if preprocessing_policy not in VALID_PREPROCESSING_POLICIES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"preprocessing_policy must be one of: {', '.join(sorted(VALID_PREPROCESSING_POLICIES))}",
+            )
         registration_id = _id("REG")
         source_path = workflows.save_upload(registration_id, filename, content)
         now = iso_now()
@@ -200,8 +208,23 @@ def create_app(
             "version_note": version_note,
             "file_name": filename,
             "source_path": str(source_path),
-            "status": "analyzing",
-            "progress": {"stage": "queued", "percent": 0},
+            "source_sha256": hashlib.sha256(content).hexdigest(),
+            "status": "validating",
+            "progress": {
+                "stage": "upload_validation",
+                "percent": 5,
+                "message": "Upload accepted; validating the canonical template page.",
+            },
+            "preprocessing": {
+                "requested_policy": preprocessing_policy,
+                "decision": None,
+                "capture_ready": None,
+                "retake_required": None,
+                "reasons": [],
+                "advisories": [],
+                "instructions": [],
+                "operations": [],
+            },
             "draft": None,
             "draft_revision": 0,
             "downstream_ids": {},
@@ -217,7 +240,12 @@ def create_app(
             target_type="template_registration",
             target_id=registration_id,
             correlation_id=correlation_id,
-            after={"file_name": filename, "form_type_id": form_type_id},
+            after={
+                "file_name": filename,
+                "form_type_id": form_type_id,
+                "source_sha256": record["source_sha256"],
+                "preprocessing_policy": preprocessing_policy,
+            },
         )
         return record
 
@@ -230,6 +258,7 @@ def create_app(
         form_type_id: str = Form("motor"),
         language: str = Form("my-en"),
         version_note: str | None = Form(None),
+        preprocessing_policy: str = Form("auto"),
     ) -> dict[str, Any]:
         content = await _read_upload(file, configured)
         record = create_registration_record(
@@ -238,6 +267,7 @@ def create_app(
             name=name,
             form_type_id=form_type_id,
             language=language,
+            preprocessing_policy=preprocessing_policy,
             version_note=version_note,
             correlation_id=request.state.correlation_id,
         )
@@ -249,13 +279,15 @@ def create_app(
         request: Request,
         background_tasks: BackgroundTasks,
         file: UploadFile = File(...),
+        preprocessing_policy: str = Form("auto"),
         name: str = Form("Insurance Claim Template"),
         form_type_id: str = Form("motor"),
     ) -> dict[str, Any]:
         content = await _read_upload(file, configured)
         record = create_registration_record(
             content=content, filename=file.filename or "template", name=name, form_type_id=form_type_id,
-            language="my-en", version_note=None, correlation_id=request.state.correlation_id,
+            language="my-en", version_note=None, preprocessing_policy=preprocessing_policy,
+            correlation_id=request.state.correlation_id,
         )
         background_tasks.add_task(workflows.run_template_registration, record["id"])
         return {"job_id": record["id"], "status": record["status"]}
@@ -382,6 +414,7 @@ def create_app(
         request: Request,
         background_tasks: BackgroundTasks,
         form_type_id: str = Query(...),
+        preprocessing_policy: str = Query("auto"),
         files: list[UploadFile] = File(...),
     ) -> dict[str, Any]:
         items = []
@@ -389,7 +422,8 @@ def create_app(
             content = await _read_upload(upload, configured)
             item = create_registration_record(
                 content=content, filename=upload.filename or "template", name=f"{form_type_id.title()} Claim Template",
-                form_type_id=form_type_id, language="my-en", version_note=None, correlation_id=request.state.correlation_id,
+                form_type_id=form_type_id, language="my-en", version_note=None,
+                preprocessing_policy=preprocessing_policy, correlation_id=request.state.correlation_id,
             )
             background_tasks.add_task(workflows.run_template_registration, item["id"])
             items.append(item)
