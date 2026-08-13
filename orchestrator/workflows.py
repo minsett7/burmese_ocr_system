@@ -41,16 +41,6 @@ PREPROCESSING_MODES = {
     "none": "none",
 }
 
-CORRECTIVE_OPERATIONS = {
-    "perspective_crop",
-    "small_angle_deskew",
-    "illumination_normalization",
-    "mild_sharpening",
-    "autocontrast",
-    "grayscale",
-}
-
-
 class WorkflowService:
     def __init__(self, settings: Settings, store: RecordStore, client: DownstreamClient):
         self.settings = settings
@@ -235,14 +225,6 @@ class WorkflowService:
         if summary.get("page_count") != 1:
             raise AdapterError("Template registration currently supports exactly one page")
 
-        capture_assessment = (
-            await self.client.request(
-                "visual-field-detection",
-                "GET",
-                f"{self.settings.visual_field_url}/v1/documents/{visual_id}/capture-assessment",
-                correlation_id=correlation_id,
-            )
-        ).json()
         artifact_path = str(preprocess_result.get("artifact") or "")
         if not artifact_path or artifact_path.startswith("/") or ".." in Path(artifact_path).parts:
             raise AdapterError("Visual-field preprocessing did not return a valid manifest artifact")
@@ -259,7 +241,6 @@ class WorkflowService:
             requested_policy,
             correction_mode,
             preprocess_manifest,
-            capture_assessment,
         )
         record["preprocessing"] = preprocessing
         record["updated_at"] = iso_now()
@@ -347,49 +328,32 @@ class WorkflowService:
         requested_policy: str,
         correction_mode: str,
         manifest: dict[str, Any],
-        assessment: dict[str, Any],
     ) -> dict[str, Any]:
         pages = manifest.get("pages") or []
         if len(pages) != 1:
             raise AdapterError("Template registration currently supports exactly one page")
 
-        assessment_pages = assessment.get("pages") or []
-        reasons = list(dict.fromkeys(
-            str(reason)
-            for page in assessment_pages
-            for reason in (page.get("reasons") or [])
-        ))
-        advisories = list(dict.fromkeys(
-            str(advisory)
-            for page in assessment_pages
-            for advisory in (page.get("advisories") or [])
-        ))
-        instructions = list(dict.fromkeys(
-            str(instruction)
-            for page in assessment_pages
-            for instruction in (page.get("instructions") or [])
-        ))
-        operations = list(dict.fromkeys(
-            str(operation)
-            for page in pages
-            for operation in (page.get("operations") or [])
-        ))
-        quality_pass = bool(manifest.get("quality_pass", False))
-        if not quality_pass:
-            quality_warnings = (
-                str(warning)
-                for page in pages
-                for warning in (page.get("quality", {}).get("warnings") or [])
-            )
-            reasons = list(dict.fromkeys([*reasons, *quality_warnings]))
-        capture_ready = bool(assessment.get("capture_ready", False)) and quality_pass
-        retake_required = bool(assessment.get("retake_required", False)) or not capture_ready
-        if retake_required:
-            decision = "reject_and_retake"
-        elif any(operation in CORRECTIVE_OPERATIONS for operation in operations):
-            decision = "correct"
-        else:
-            decision = "canonicalize_only"
+        decision = manifest.get("decision")
+        if decision not in {"canonicalize_only", "correct", "reject_and_retake"}:
+            raise AdapterError("Preprocessing manifest did not provide a valid authoritative decision")
+        capture_ready = manifest.get("capture_ready")
+        retake_required = manifest.get("retake_required")
+        quality_pass = manifest.get("quality_pass")
+        if any(type(value) is not bool for value in (capture_ready, retake_required, quality_pass)):
+            raise AdapterError("Preprocessing manifest decision flags must be boolean")
+        if retake_required == capture_ready:
+            raise AdapterError("Preprocessing manifest has inconsistent capture decision flags")
+        if (decision == "reject_and_retake") != retake_required:
+            raise AdapterError("Preprocessing manifest decision conflicts with its retake flag")
+        if capture_ready and not quality_pass:
+            raise AdapterError("Preprocessing manifest cannot accept a page that failed quality checks")
+
+        authoritative_lists: dict[str, list[str]] = {}
+        for field in ("reasons", "advisories", "instructions", "operations"):
+            value = manifest.get(field)
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise AdapterError(f"Preprocessing manifest {field} must be a list of strings")
+            authoritative_lists[field] = list(dict.fromkeys(value))
 
         return {
             "requested_policy": requested_policy,
@@ -397,10 +361,10 @@ class WorkflowService:
             "decision": decision,
             "capture_ready": capture_ready,
             "retake_required": retake_required,
-            "reasons": reasons,
-            "advisories": advisories,
-            "instructions": instructions,
-            "operations": operations,
+            "reasons": authoritative_lists["reasons"],
+            "advisories": authoritative_lists["advisories"],
+            "instructions": authoritative_lists["instructions"],
+            "operations": authoritative_lists["operations"],
             "quality_pass": quality_pass,
             "capture_profile": manifest.get("capture_profile"),
             "page_count": int(manifest.get("page_count", len(pages))),

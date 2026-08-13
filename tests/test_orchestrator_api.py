@@ -37,6 +37,7 @@ class FakeDownstreams:
         self.processed_documents = 0
         self.retake_required = False
         self.quality_pass = True
+        self.preprocessing_decision = "canonicalize_only"
         self.preprocessing_operations = ["exif_orientation", "rgb_conversion"]
         self.fail_layout = False
         self.fail_ocr = False
@@ -51,7 +52,13 @@ class FakeDownstreams:
         if method == "POST" and path == "/v1/documents":
             return httpx.Response(201, json={"document_id": "visual-doc", "status": "uploaded"})
         if method == "POST" and path.endswith("/preprocess"):
-            capture_ready = not self.retake_required
+            capture_ready = not self.retake_required and self.quality_pass
+            decision = "reject_and_retake" if not capture_ready else self.preprocessing_decision
+            reasons = (
+                ["image_too_blurry"]
+                if self.retake_required
+                else (["image_may_be_blurry"] if not self.quality_pass else [])
+            )
             return httpx.Response(
                 200,
                 json={
@@ -60,10 +67,15 @@ class FakeDownstreams:
                     "artifact": "preprocessed/preprocess_manifest.json",
                     "summary": {
                         "page_count": 1,
-                        "quality_pass": self.quality_pass and capture_ready,
+                        "quality_pass": self.quality_pass,
                         "capture_profile": "template",
+                        "decision": decision,
                         "capture_ready": capture_ready,
-                        "retake_required": self.retake_required,
+                        "retake_required": not capture_ready,
+                        "reasons": reasons,
+                        "advisories": [],
+                        "instructions": ["Hold still, tap to focus and capture again."] if self.retake_required else [],
+                        "operations": self.preprocessing_operations,
                     },
                 },
             )
@@ -93,15 +105,27 @@ class FakeDownstreams:
                 },
             )
         if method == "GET" and path.endswith("/artifacts/preprocessed/preprocess_manifest.json"):
-            capture_ready = not self.retake_required
+            capture_ready = not self.retake_required and self.quality_pass
+            decision = "reject_and_retake" if not capture_ready else self.preprocessing_decision
+            reasons = (
+                ["image_too_blurry"]
+                if self.retake_required
+                else (["image_may_be_blurry"] if not self.quality_pass else [])
+            )
             return httpx.Response(
                 200,
                 json={
-                    "schema_version": "1.2.0",
+                    "schema_version": "1.3.0",
                     "capture_profile": "template",
+                    "decision": decision,
                     "capture_ready": capture_ready,
+                    "retake_required": not capture_ready,
+                    "reasons": reasons,
+                    "advisories": [],
+                    "instructions": ["Hold still, tap to focus and capture again."] if self.retake_required else [],
+                    "operations": self.preprocessing_operations,
                     "page_count": 1,
-                    "quality_pass": self.quality_pass and capture_ready,
+                    "quality_pass": self.quality_pass,
                     "pages": [
                         {
                             "image_path": "preprocessed/pages/page_001.png",
@@ -347,6 +371,7 @@ def test_preprocessing_policy_is_mapped_and_decision_is_persisted(
     decision,
 ):
     test_client, fake = client
+    fake.preprocessing_decision = decision
     fake.preprocessing_operations = operations
     page = png_bytes()
 
@@ -365,6 +390,10 @@ def test_preprocessing_policy_is_mapped_and_decision_is_persisted(
     assert registration["preprocessing"]["requested_policy"] == policy
     assert registration["preprocessing"]["correction_mode"] == correction_mode
     assert registration["preprocessing"]["decision"] == decision
+    assert not any(
+        request.url.path.endswith("/capture-assessment")
+        for request in fake.requests
+    )
     preprocess_request = next(
         request
         for request in fake.requests
@@ -402,6 +431,31 @@ def test_failed_capture_stops_before_layout_ocr_and_vlm(client):
     assert "image_too_blurry" in registration["preprocessing"]["reasons"]
     assert registration["preprocessing"]["instructions"]
 
+    attempted = {(request.method, request.url.path) for request in fake.requests}
+    assert ("POST", "/v1/documents/visual-doc/extract") not in attempted
+    assert ("POST", "/v1/ocr/process") not in attempted
+    assert ("POST", "/api/v1/registrations") not in attempted
+
+
+def test_missing_authoritative_preprocessing_decision_fails_contract(client):
+    test_client, fake = client
+    fake.preprocessing_decision = None
+
+    response = test_client.post(
+        "/api/v1/template-registrations",
+        data={"form_type_id": "motor", "preprocessing_policy": "auto"},
+        files={"file": ("blank.png", png_bytes(), "image/png")},
+    )
+
+    assert response.status_code == 202, response.text
+    registration = test_client.get(
+        f"/api/v1/template-registrations/{response.json()['id']}"
+    ).json()
+    assert registration["status"] == "failed"
+    assert registration["failure"] == {
+        "code": "CONTRACT_ERROR",
+        "message": "Preprocessing manifest did not provide a valid authoritative decision",
+    }
     attempted = {(request.method, request.url.path) for request in fake.requests}
     assert ("POST", "/v1/documents/visual-doc/extract") not in attempted
     assert ("POST", "/v1/ocr/process") not in attempted
