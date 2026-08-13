@@ -34,3 +34,5 @@ model_weights/
 *.tiff
 *.webp
 !integration-tests/fixtures/*.png
+
+data/

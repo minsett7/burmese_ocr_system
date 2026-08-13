@@ -222,11 +222,34 @@ docker compose --profile gpu up --build --detach insurance-vlm-gpu orchestrator 
 
 The GPU service uses one worker and is published on host port 18004 for diagnostics. The default CPU/mock VLM may also be present because it is the orchestrator's baseline health dependency; with `INSURANCE_VLM_URL` set as above, workflow requests go to the GPU service. GPU/model quality validation must be performed separately on suitable hardware.
 
+### Desktop llama.cpp VLM
+
+For a low-VRAM demo workstation, run the Qwen3-VL 2B Q4_K_M GGUF with llama.cpp on the GPU desktop and keep the Insurance-VLM API on VM port 8004. Configure the VM's ignored `.env` with an address reachable from Docker:
+
+```env
+VLM_ENGINE=llama_cpp
+VLM_LLAMA_URL=http://DESKTOP_LAN_OR_VPN_IP:8081
+VLM_LLAMA_MODEL=Qwen3VL-2B-Instruct-Q4_K_M.gguf
+VLM_LLAMA_TIMEOUT_SECONDS=900
+VLM_MAX_NEW_TOKENS=900
+VLM_IMAGE_MIN_PIXELS=65536
+VLM_IMAGE_MAX_PIXELS=131072
+VLM_POLL_TIMEOUT_SECONDS=1200
+```
+
+The model value must match a model ID accepted by the desktop server; the basename above is accepted by the verified launcher. Before starting a demo, verify the VM can reach `GET /health` and `GET /v1/models` on desktop port 8081, then run:
+
+```bash
+docker compose up --build --detach insurance-vlm orchestrator frontend
+```
+
+The desktop firewall should restrict TCP 8081 to the VM address. Do not publish the llama.cpp endpoint broadly.
+
 ## Template registration and approval
 
 Canonical API flow:
 
-1. `POST /api/v1/template-registrations` (or legacy `POST /api/v1/templates/register`) uploads one blank form.
+1. `POST /api/v1/template-registrations` (or legacy `POST /api/v1/templates/register`) uploads one blank form file. The file can be a multi-page PDF.
 2. Poll `GET /api/v1/template-registrations/{id}` or `GET /api/v1/templates/jobs/{id}`.
 3. Read the draft at `GET /api/v1/templates/jobs/{id}/result`.
 4. Optionally save the complete editable region set with `PUT /api/v1/template-registrations/{id}/draft`; stale revisions return 409.
@@ -235,7 +258,27 @@ Canonical API flow:
 
 The orchestrator never auto-publishes a VLM result. Approval converts supported types to `printed_text`, `handwriting`, `checkbox`, `table`, or `signature`, rejects unresolved mappings, creates an immutable version record, and registers that exact definition with the document-processing service.
 
-Internally, registration uses the visual-field service's exact preprocessed page bytes for both OCR and VLM. The OCR and layout contracts share the same SHA-256, dimensions, document ID, page ID, and page number. Normalized OCR boxes become pixel `xyxy`; approved normalized `xywh` regions become document-processing pixel `xywh`.
+The production frontend at `http://localhost:3000/#/templates` uses this canonical flow. It polls progress, shows retake instructions and failures, renders each canonical page with authoritative detector boxes, saves the complete draft with optimistic revisions, and calls server validation before approval. Page buttons switch the visible image and regions without dropping edits made on other pages. Detector regions can be disabled but cannot be deleted or duplicated. Model `review_flags` must be explicitly marked reviewed before approval.
+
+Internally, registration uses each visual-field canonical page's exact bytes for OCR and the matching VLM job. The OCR and layout contracts share the same SHA-256, dimensions, document ID, page ID, and page number. Normalized OCR boxes become pixel `xyxy`; approved normalized `xywh` regions become page-specific document-processing pixel `xywh`.
+
+### Register and inspect a multi-page form
+
+Upload the PDF as one file and poll the returned registration ID:
+
+```bash
+curl -F 'file=@data/Vehicle Damage Claim Form.pdf' \
+  -F 'form_type_id=motor' \
+  http://localhost:8000/api/v1/template-registrations
+
+curl http://localhost:8000/api/v1/template-registrations/REGISTRATION_ID
+curl http://localhost:8000/api/v1/template-registrations/REGISTRATION_ID/pages/1
+curl http://localhost:8000/api/v1/template-registrations/REGISTRATION_ID/pages/2
+```
+
+The result has one entry per canonical page in `image_identities` and `draft.pages`. Every editable region has a positive `page` number. `downstream_ids.vlm_jobs` records the independent VLM job created for each page. Page inference is sequential so the same deployment works with a small external GPU host; the final draft is still one form and is approved once.
+
+For image uploads, the default `preprocessing_policy=auto` treats JPEG/JPG as likely camera captures and applies document-boundary/glare/background checks. Lossless PNG, BMP, and TIFF inputs are treated as scanner or rendered-digital pages and skip those camera-only rejection checks. Use `preprocessing_policy=force` when a PNG is actually a photographed page and needs forced perspective correction; the orchestrator maps it to the visual service's internal `correction_mode=standard`.
 
 ## Completed-document workflow
 
@@ -269,11 +312,11 @@ The unified orchestrator implements the prototype paths expected by `frontend/sr
 
 The umbrella follows service code when repository documentation is stale:
 
-- OCR code returns canonical `schema_version`, `document_id`, `model`, and `pages[].tokens[]`; its older README sample still shows a flat `results` array. The adapter consumes the code-level paged response.
+- OCR returns canonical `schema_version`, `document_id`, `model`, and `pages[].tokens[]`. The adapter consumes this page-aware response.
 - OCR `bounding_box` is currently pixel `[x_min,y_min,x_max,y_max]`; the adapter also accepts unambiguous legacy normalized boxes and never scales pixel boxes twice.
-- Insurance-VLM v1 strict registration accepts exactly one image page plus OCR/layout JSON and always sets `review_required`; mock mode intentionally emits no semantic fields.
+- Insurance-VLM v1 strict registration accepts exactly one image page plus OCR/layout JSON and always sets `review_required`; the orchestrator fans a multi-page form out into sequential page jobs and merges them. Mock mode intentionally emits no semantic fields.
 - Visual-field detection owns canonical page pixels and authoritative layout geometry. Table cells retain `parent_region_id` links to table regions.
-- Document processing is synchronous at `POST /api/v1/documents/process`, has an in-memory template/job registry, and writes exports to its storage volume. Its PostgreSQL scaffold is not part of the active pipeline.
+- Document processing is synchronous at `POST /api/v1/documents/process`, renders multi-page PDFs with `pdftoppm`, applies template fields by page, has an in-memory template/job registry, and writes exports to its storage volume. Its PostgreSQL scaffold is not part of the active pipeline.
 - The frontend repository's FastAPI service is a prototype with mock OCR. Production traffic goes through the umbrella orchestrator only.
 
 ## Develop an individual service

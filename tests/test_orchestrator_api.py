@@ -13,6 +13,7 @@ from PIL import Image
 from orchestrator.config import Settings
 from orchestrator.database import create_session_factory
 from orchestrator.main import create_app
+from orchestrator.workflows import WorkflowService
 
 
 def png_bytes() -> bytes:
@@ -41,6 +42,7 @@ class FakeDownstreams:
         self.preprocessing_operations = ["exif_orientation", "rgb_conversion"]
         self.fail_layout = False
         self.fail_ocr = False
+        self.ocr_identity_overrides: dict[str, object] = {}
         self.requests: list[httpx.Request] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -152,7 +154,9 @@ class FakeDownstreams:
             return httpx.Response(
                 200,
                 json={
+                    "schema_version": "1.1.0",
                     "document_id": "visual-doc",
+                    "coordinate_space": "preprocessed_page_pixels",
                     "model": {"name": "PP-DocLayoutV3", "version": "test"},
                     "pages": [
                         {
@@ -160,6 +164,7 @@ class FakeDownstreams:
                             "page_number": 1,
                             "width": 100,
                             "height": 200,
+                            "image_sha256": hashlib.sha256(self.page).hexdigest(),
                             "image_path": "preprocessed/pages/page_001.png",
                             "regions": [
                                 {"region_id": "line-1", "class_name": "input_line", "confidence": 0.9, "bbox_px": [10, 30, 90, 50]},
@@ -174,12 +179,23 @@ class FakeDownstreams:
         if method == "POST" and path == "/v1/ocr/process":
             if self.fail_ocr:
                 return httpx.Response(503, json={"detail": "ocr unavailable"})
+            page_identity = {
+                "page_id": "page_001",
+                "page_number": 1,
+                "image_sha256": hashlib.sha256(self.page).hexdigest(),
+                "width": 100,
+                "height": 200,
+                **self.ocr_identity_overrides,
+            }
             return httpx.Response(
                 200,
                 json={
+                    "schema_version": "1.0.0",
+                    "document_id": "visual-doc",
                     "model": {"engine": "Tesseract", "version": "1"},
                     "pages": [
                         {
+                            **page_identity,
                             "tokens": [
                                 {"token_id": "tok_0001", "text": "Policy", "normalized_text": "Policy", "language": "eng", "confidence": 0.9, "reading_order": 0, "bounding_box": [10, 10, 40, 20]}
                             ]
@@ -195,10 +211,117 @@ class FakeDownstreams:
             return httpx.Response(
                 200,
                 json={
+                    "job_id": "job_vlm",
                     "status": "COMPLETED",
+                    "accepted": True,
                     "review_required": True,
-                    "semantic_output": {"pages": [{"page_id": "page_001", "semantic_labels": [], "fields": []}], "warnings": []},
-                    "quality_summary": {"actionable_coverage_ratio": 0, "quality_status": "INCOMPLETE_REVIEW_REQUIRED"},
+                    "semantic_output": {
+                        "schema_version": "1.0.0",
+                        "document_id": "visual-doc",
+                        "status": "REVIEW_REQUIRED",
+                        "document_class": None,
+                        "template_name": None,
+                        "pages": [{
+                            "page_id": "page_001",
+                            "page_number": 1,
+                            "semantic_labels": [{
+                                "label_id": "label_policy",
+                                "token_ids": ["token_tok_0001"],
+                                "semantic_class": "FIELD_LABEL",
+                                "primary_text": "Policy",
+                                "primary_language": "en",
+                                "translations": {"my": None, "en": "Policy"},
+                                "confidence": 0.95,
+                            }],
+                            "fields": [
+                                {
+                                    "field_id": "field_policy",
+                                    "key": "policy",
+                                    "label_id": "label_policy",
+                                    "region_ids": ["region_line-1"],
+                                    "field_type": "text",
+                                    "relationship": "RIGHT_OF",
+                                    "required": False,
+                                    "confidence": 0.92,
+                                    "review_notes": [],
+                                },
+                                {
+                                    "field_id": "field_confirmed",
+                                    "key": "confirmed",
+                                    "label_id": "label_policy",
+                                    "region_ids": ["region_check-1"],
+                                    "field_type": "boolean",
+                                    "relationship": "CHECKBOX_BEFORE",
+                                    "required": False,
+                                    "confidence": 0.88,
+                                    "review_notes": [],
+                                },
+                            ],
+                        }],
+                        "warnings": [],
+                    },
+                    "coverage_output": {
+                        "schema_version": "1.0.0",
+                        "document_id": "visual-doc",
+                        "page_id": "page_001",
+                        "input_region_count": 2,
+                        "actionable_region_count": 2,
+                        "assigned_region_count": 2,
+                        "assigned_review_region_count": 0,
+                        "unassigned_region_count": 0,
+                        "structural_region_count": 0,
+                        "review_region_count": 0,
+                        "records": [
+                            {
+                                "region_id": "region_line-1",
+                                "region_type": "INPUT_LINE",
+                                "bbox_px": [10, 30, 90, 50],
+                                "parent_region_id": None,
+                                "status": "ASSIGNED",
+                                "field_id": "field_policy",
+                                "semantic_key": "policy",
+                                "field_type": "text",
+                                "confidence": 0.92,
+                                "needs_review": False,
+                                "assignment_review_required": False,
+                            },
+                            {
+                                "region_id": "region_check-1",
+                                "region_type": "CHECKBOX",
+                                "bbox_px": [10, 70, 30, 90],
+                                "parent_region_id": None,
+                                "status": "ASSIGNED",
+                                "field_id": "field_confirmed",
+                                "semantic_key": "confirmed",
+                                "field_type": "boolean",
+                                "confidence": 0.88,
+                                "needs_review": False,
+                                "assignment_review_required": False,
+                            },
+                        ],
+                    },
+                    "table_output": {
+                        "schema_version": "1.0.0",
+                        "document_id": "visual-doc",
+                        "page_id": "page_001",
+                        "table_count": 0,
+                        "tables": [],
+                    },
+                    "consistency_warnings": [],
+                    "quality_summary": {
+                        "target_region_count": 2,
+                        "semantic_field_count": 2,
+                        "assigned_region_count": 2,
+                        "assigned_review_region_count": 0,
+                        "unassigned_region_count": 0,
+                        "structural_region_count": 0,
+                        "actionable_coverage_ratio": 1.0,
+                        "semantic_consistency_warning_count": 0,
+                        "structured_table_count": 0,
+                        "mapping_complete": True,
+                        "quality_status": "MAPPED",
+                        "automation_ready": False,
+                    },
                 },
             )
         if method == "POST" and path == "/api/v1/templates/register":
@@ -529,6 +652,24 @@ def test_canonical_page_is_established_before_layout_and_ocr(client):
         "page_id": "page_001",
         "page_number": 1,
     }
+    draft = registration["draft"]
+    assert draft["schema_version"] == "1.0.0"
+    assert draft["revision"] == 1
+    assert draft["page"] == {
+        "page_id": "page_001",
+        "page_number": 1,
+        "image_url": f"/api/v1/template-registrations/{registration_id}/pages/1",
+        "width": 100,
+        "height": 200,
+        "sha256": expected_sha,
+    }
+    assert draft["unassigned_regions"] == []
+    assert draft["structural_regions"] == []
+    assert {item["geometry_source"] for item in draft["regions"]} == {"PP-DocLayoutV3"}
+    assert {item["field_id"] for item in draft["regions"]} == {
+        "field_policy",
+        "field_confirmed",
+    }
     assert registration["preprocessing"]["pages"][0]["image_path"] == (
         "preprocessed/pages/page_001.png"
     )
@@ -549,6 +690,168 @@ def test_canonical_page_is_established_before_layout_and_ocr(client):
     ocr_index = requests.index(("POST", "/v1/ocr/process"))
     assert canonical_index < layout_index
     assert canonical_index < ocr_index
+    ocr_request = next(
+        request
+        for request in fake.requests
+        if request.method == "POST" and request.url.path == "/v1/ocr/process"
+    )
+    assert ocr_request.url.params["document_id"] == "visual-doc"
+    assert ocr_request.url.params["preprocess_mode"] == "minimal"
+
+
+def test_draft_preserves_authoritative_metadata_and_tracks_human_geometry(client):
+    test_client, _ = client
+    response = test_client.post(
+        "/api/v1/template-registrations",
+        data={"form_type_id": "motor"},
+        files={"file": ("blank.png", png_bytes(), "image/png")},
+    )
+    registration_id = response.json()["id"]
+    registration = test_client.get(
+        f"/api/v1/template-registrations/{registration_id}"
+    ).json()
+    draft = registration["draft"]
+
+    tampered = test_client.put(
+        f"/api/v1/template-registrations/{registration_id}/draft",
+        json={
+            "revision": draft["revision"],
+            "page": {**draft["page"], "sha256": "0" * 64},
+            "regions": draft["regions"],
+        },
+    )
+    assert tampered.status_code == 422
+    assert "authoritative" in tampered.json()["detail"]
+
+    regions = [dict(item) for item in draft["regions"]]
+    regions[0]["bbox"] = {"x": 0.2, "y": 0.2, "width": 0.3, "height": 0.1}
+    saved = test_client.put(
+        f"/api/v1/template-registrations/{registration_id}/draft",
+        json={"revision": draft["revision"], "regions": regions},
+    )
+    assert saved.status_code == 200, saved.text
+    updated = saved.json()["draft"]
+    assert updated["revision"] == 2
+    assert updated["page"] == draft["page"]
+    assert updated["regions"][0]["geometry_source"] == "human_corrected"
+
+
+def test_unresolved_review_flag_blocks_approval_until_cleared(client):
+    test_client, _ = client
+    response = test_client.post(
+        "/api/v1/template-registrations",
+        data={"form_type_id": "motor"},
+        files={"file": ("blank.png", png_bytes(), "image/png")},
+    )
+    registration_id = response.json()["id"]
+    registration = test_client.get(
+        f"/api/v1/template-registrations/{registration_id}"
+    ).json()
+    regions = [dict(item) for item in registration["draft"]["regions"]]
+    regions[0]["review_flags"] = ["Reviewer must confirm this mapping"]
+    saved = test_client.put(
+        f"/api/v1/template-registrations/{registration_id}/draft",
+        json={"revision": 1, "regions": regions},
+    )
+    assert saved.status_code == 200, saved.text
+
+    validation = test_client.post(
+        f"/api/v1/template-registrations/{registration_id}/validate"
+    ).json()
+    assert validation["valid"] is False
+    assert "unresolved review flag" in validation["errors"][0]
+    blocked = test_client.post(
+        f"/api/v1/template-registrations/{registration_id}/approve"
+    )
+    assert blocked.status_code == 422
+
+    regions[0]["review_flags"] = []
+    cleared = test_client.put(
+        f"/api/v1/template-registrations/{registration_id}/draft",
+        json={"revision": 2, "regions": regions},
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert test_client.post(
+        f"/api/v1/template-registrations/{registration_id}/validate"
+    ).json()["valid"] is True
+
+
+def test_checkbox_group_options_become_unique_editable_draft_fields():
+    service = object.__new__(WorkflowService)
+    layout = {
+        "pages": [{
+            "regions": [
+                {"region_id": "check-car", "region_type": "CHECKBOX", "bbox_px": [10, 10, 30, 30], "confidence": 0.9, "parent_region_id": None},
+                {"region_id": "check-truck", "region_type": "CHECKBOX", "bbox_px": [40, 10, 60, 30], "confidence": 0.8, "parent_region_id": None},
+            ]
+        }]
+    }
+    result = {
+        "semantic_output": {
+            "pages": [{
+                "semantic_labels": [{"label_id": "vehicle-label", "primary_text": "Vehicle type", "primary_language": "en", "token_ids": []}],
+                "fields": [{
+                    "field_id": "field_vehicle_type",
+                    "key": "vehicle_type",
+                    "label_id": "vehicle-label",
+                    "region_ids": ["check-car", "check-truck"],
+                    "field_type": "multiple_choice",
+                    "relationship": "GROUP_BELOW",
+                    "confidence": 0.8,
+                    "review_notes": [],
+                    "options": [
+                        {"option_key": "car", "value": "Car", "control_region_id": "check-car"},
+                        {"option_key": "truck", "value": "Truck", "control_region_id": "check-truck"},
+                    ],
+                }],
+                "warnings": [],
+            }]
+        },
+        "coverage_output": {"records": []},
+        "quality_summary": {},
+    }
+    record = {
+        "id": "REG-OPTIONS",
+        "image_identity": {"page_id": "page_001", "page_number": 1, "sha256": "a" * 64, "width": 100, "height": 100},
+        "adapter_warnings": [],
+        "relationship_warnings": [],
+    }
+
+    draft = service._build_editable_draft(record, result, layout)
+
+    assert [region["field_id"] for region in draft["regions"]] == [
+        "field_vehicle_type_car", "field_vehicle_type_truck"
+    ]
+    assert [region["key"] for region in draft["regions"]] == [
+        "vehicle_type_car", "vehicle_type_truck"
+    ]
+    assert [region["source_region_ids"] for region in draft["regions"]] == [
+        ["check-car"], ["check-truck"]
+    ]
+
+
+def test_canonical_identity_mismatch_prevents_vlm_submission(client):
+    test_client, fake = client
+    fake.ocr_identity_overrides["image_sha256"] = "0" * 64
+
+    response = test_client.post(
+        "/api/v1/template-registrations",
+        data={"form_type_id": "motor", "preprocessing_policy": "auto"},
+        files={"file": ("blank.png", fake.page, "image/png")},
+    )
+
+    assert response.status_code == 202, response.text
+    registration = test_client.get(
+        f"/api/v1/template-registrations/{response.json()['id']}"
+    ).json()
+    assert registration["status"] == "failed"
+    assert registration["progress"]["stage"] == "failed"
+    assert registration["failure"] == {
+        "code": "CONTRACT_ERROR",
+        "message": "OCR image_sha256 does not match the canonical page",
+    }
+    attempted = {(request.method, request.url.path) for request in fake.requests}
+    assert ("POST", "/api/v1/registrations") not in attempted
 
 
 @pytest.mark.parametrize(

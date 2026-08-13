@@ -43,24 +43,35 @@ sequenceDiagram
     O->>L: POST /v1/documents (original bytes)
     L-->>O: visual document_id
     O->>L: POST /v1/documents/{id}/preprocess
-    O->>L: POST /v1/documents/{id}/extract
-    O->>L: GET /v1/documents/{id}/result
-    L-->>O: visual_fields.json + exact page artifact path
-    O->>L: GET /v1/documents/{id}/artifacts/{page_path}
-    L-->>O: canonical preprocessed page bytes
-    O->>DB: Store canonical page and SHA-256
-    O->>OCR: POST /v1/ocr/process (same page bytes)
-    OCR-->>O: paged OCR token JSON
-    O->>O: Build strict OCR/layout contracts
-    Note over O: Same document/page IDs, page number,<br/>SHA-256, width, height; validated pixel geometry
-    O->>VLM: POST /api/v1/registrations<br/>image + OCR JSON + layout JSON
-    VLM-->>O: PENDING job_id
-    loop Bounded polling until completed, failed, or timeout
-        O->>VLM: GET /api/v1/registrations/{job_id}
-        VLM-->>O: job status
+    L-->>O: manifest containing all canonical page artifacts
+    loop Every canonical page
+        O->>L: GET /v1/documents/{id}/artifacts/{page_path}
+        L-->>O: exact canonical page bytes
+        O->>DB: Store page, SHA-256, dimensions, and page number
     end
-    O->>VLM: GET /api/v1/registrations/{job_id}/result
-    VLM-->>O: Semantic draft + coverage + review_required
+    par Document-wide layout extraction
+        O->>L: POST /v1/documents/{id}/extract
+        O->>L: GET /v1/documents/{id}/result
+        L-->>O: visual_fields.json for all pages
+    and Page-scoped OCR
+        loop Every canonical page
+            O->>OCR: POST /v1/ocr/process (same page bytes + page_number)
+            OCR-->>O: one-page OCR token JSON
+        end
+    end
+    loop Every page, sequentially
+        O->>O: Build strict one-page OCR/layout contracts
+        Note over O: Same document/page IDs, page number,<br/>SHA-256, width, height; validated pixel geometry
+        O->>VLM: POST /api/v1/registrations<br/>one image + matching OCR/layout JSON
+        VLM-->>O: PENDING job_id
+        loop Bounded polling until terminal
+            O->>VLM: GET /api/v1/registrations/{job_id}
+            VLM-->>O: job status
+        end
+        O->>VLM: GET /api/v1/registrations/{job_id}/result
+        VLM-->>O: Page semantic draft + coverage + review_required
+    end
+    O->>O: Merge page drafts and make field IDs/keys unique
     O->>DB: Store editable draft; status needs_approval
     O-->>UI: Draft, page, warnings, geometry
     Reviewer->>UI: Correct mappings and explicitly approve
@@ -113,7 +124,7 @@ All cross-service transformations live in `adapters/contracts.py` or workflow-sp
 
 ### Authoritative page identity
 
-The visual-field preprocessed page is the single authoritative image. `ImageIdentity` is computed from its exact bytes and contains:
+Each visual-field preprocessed page is an authoritative image. An `ImageIdentity` is computed from the exact bytes of every page and contains:
 
 - SHA-256
 - pixel width and height
@@ -121,7 +132,35 @@ The visual-field preprocessed page is the single authoritative image. `ImageIden
 - `page_###` page ID
 - positive page number
 
-Both Insurance-VLM payloads receive those same values. OCR is called with the same page bytes, and the raw OCR service's independent document identity is replaced at the adapter boundary. This prevents OCR/layout drift caused by separate resize or preprocessing operations.
+The matching Insurance-VLM payload receives those same values. OCR is called with the same page bytes and explicit page number, and the raw OCR service's independent document identity is replaced at the adapter boundary. This prevents OCR/layout drift caused by separate resize or preprocessing operations.
+
+### Multi-page fan-out and merge
+
+Insurance-VLM deliberately retains its strict one-page registration contract. The orchestrator turns a multi-page source into that contract without losing page identity:
+
+1. The visual service renders/canonicalizes all source pages and returns one ordered manifest.
+2. The orchestrator downloads and validates every page before inference starts.
+3. Layout extraction runs once for the document while OCR runs once per canonical page.
+4. The orchestrator selects only that page's layout regions and OCR tokens, then creates one strict VLM registration per page.
+5. VLM registrations run sequentially. This is intentional for small GPU hosts such as a 4 GB GTX 1650.
+6. The page drafts are merged into `draft.pages` and page-tagged `draft.regions`. Duplicate generated field IDs and keys are deterministically deconflicted across the whole form.
+
+The saved editable draft always contains every page. Selecting a page in the UI changes only which regions are displayed; saving sends the complete region collection so edits on another page are not lost.
+
+### Implementation map
+
+Use these files to follow the construction from input to approval:
+
+| Concern | Main implementation |
+|---|---|
+| Registration state machine, canonical page collection, per-page OCR/VLM fan-out, and draft merge | [`orchestrator/workflows.py`](orchestrator/workflows.py) |
+| Public registration, page-image, save, validate, and approval routes | [`orchestrator/main.py`](orchestrator/main.py) |
+| Identity/geometry validation, strict VLM contracts, and normalized-to-integer approval conversion | [`adapters/contracts.py`](adapters/contracts.py) |
+| Camera-vs-digital preprocessing decision and capture-quality aggregation | [`services/visual-field-detection/app/preprocessing.py`](services/visual-field-detection/app/preprocessing.py) |
+| OCR page numbering, exact image hashing, paged token response | [`services/ocr-fastapi-service/app/ocr_engine.py`](services/ocr-fastapi-service/app/ocr_engine.py) |
+| Runtime template page schema and bounds validation | [`services/document-processing-layer/app/models/schemas.py`](services/document-processing-layer/app/models/schemas.py) |
+| PDF rendering and page-aware runtime extraction | [`services/document-processing-layer/app/api/endpoints/documents.py`](services/document-processing-layer/app/api/endpoints/documents.py), [`pipeline_orchestrator.py`](services/document-processing-layer/app/services/pipeline_orchestrator.py) |
+| Frontend page selection, page-local rendering, and full-draft save | [`TemplateWorkspace.jsx`](services/insurance-claim-ui/frontend/src/TemplateWorkspace.jsx), [`templateEditorModel.js`](services/insurance-claim-ui/frontend/src/templateEditorModel.js) |
 
 ### Geometry conventions
 
@@ -131,7 +170,7 @@ Both Insurance-VLM payloads receive those same values. OCR is called with the sa
 | Current OCR response | `bounding_box` as `xyxy` | Page pixels |
 | Legacy OCR examples | normalized `xyxy` | 0 to 1 |
 | Editable frontend draft | `{x, y, width, height}` | Normalized 0 to 1 |
-| Document-processing TemplateDefinition | `{x, y, width, height}` | Page pixels |
+| Document-processing TemplateDefinition | `{x, y, width, height}` plus field `page` | Pixels of the referenced template page |
 
 Every conversion checks finite coordinates, positive area, and page bounds. Missing geometry is an error; it is never fabricated. Values whose four OCR coordinates all lie in 0..1 are the only values treated as legacy normalized boxes.
 
@@ -195,10 +234,10 @@ The orchestrator currently uses FastAPI background tasks and Insurance-VLM uses 
 These constraints are verified from the pinned code and influence the umbrella design:
 
 1. Visual-field preprocessing and extraction are synchronous HTTP operations even though the orchestrator presents an asynchronous job abstraction.
-2. Insurance-VLM v1 accepts one page per registration. The orchestrator rejects multi-page template registration rather than selecting or merging pages silently.
+2. Insurance-VLM v1 accepts one page per registration. The orchestrator creates sequential page-scoped VLM jobs and merges their results into one draft; it never silently selects only the first page.
 3. Insurance-VLM mock mode validates contracts but does not create semantic fields; reviewers must map fields before approval.
-4. The OCR README's flat sample is older than its current paged Pydantic response. The adapter follows the code.
-5. Document processing synchronously returns a job record, uses in-memory registries, and generates exports on its persistent storage mount.
+4. OCR returns a paged Pydantic response. The adapter validates each page against its canonical visual identity before building a VLM contract.
+5. Document processing synchronously returns a job record, renders uploaded PDFs with `pdftoppm`, applies each field to its declared page, uses in-memory registries, and generates exports on its persistent storage mount.
 6. The React frontend's compatibility client is maintained inside its submodule, while all production compatibility endpoints and records are served by the umbrella orchestrator.
 
 ## Deployment profiles

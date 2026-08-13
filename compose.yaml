@@ -99,11 +99,17 @@ services:
       dockerfile: docker/insurance-vlm.Dockerfile
     environment:
       VLM_ENGINE: ${VLM_ENGINE:-mock}
+      VLM_LLAMA_URL: ${VLM_LLAMA_URL:-http://127.0.0.1:8081}
+      VLM_LLAMA_MODEL: ${VLM_LLAMA_MODEL:-Qwen/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M}
+      VLM_LLAMA_TIMEOUT_SECONDS: ${VLM_LLAMA_TIMEOUT_SECONDS:-900}
       VLM_API_KEY: ${VLM_API_KEY:-local-vlm-key}
       VLM_JOBS_DIR: /var/lib/insurance-vlm/jobs
       VLM_MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-25}
       VLM_WORKERS: "1"
       VLM_PRELOAD_MODEL: "false"
+      VLM_MAX_NEW_TOKENS: ${VLM_MAX_NEW_TOKENS:-900}
+      VLM_IMAGE_MIN_PIXELS: ${VLM_IMAGE_MIN_PIXELS:-65536}
+      VLM_IMAGE_MAX_PIXELS: ${VLM_IMAGE_MAX_PIXELS:-131072}
     volumes:
       - vlm_jobs:/var/lib/insurance-vlm/jobs
     ports:

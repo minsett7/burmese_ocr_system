@@ -16,7 +16,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from openpyxl import Workbook
 
-from adapters.contracts import AdapterError
+from adapters.contracts import (
+    AdapterError,
+    EXTRACTION_MODES,
+    VLM_FIELD_TYPES,
+    normalized_xywh_to_xyxy,
+)
 
 from . import __version__
 from .config import Settings
@@ -310,10 +315,13 @@ def create_app(
 
     @app.get("/api/v1/template-registrations/{registration_id}/pages/{page_number}", tags=["templates"])
     async def registration_page(registration_id: str, page_number: int):
-        _record_or_404(store, "registration", registration_id)
-        if page_number != 1:
+        record = _record_or_404(store, "registration", registration_id)
+        identities = record.get("image_identities") or (
+            [record["image_identity"]] if record.get("image_identity") else []
+        )
+        if not any(item.get("page_number") == page_number for item in identities):
             raise HTTPException(status_code=404, detail="page not found")
-        path = configured.storage_root / registration_id / "page_001.png"
+        path = configured.storage_root / registration_id / f"page_{page_number:03d}.png"
         if not path.is_file():
             raise HTTPException(status_code=404, detail="page not found")
         return FileResponse(path, media_type="image/png")
@@ -328,8 +336,44 @@ def create_app(
         if not isinstance(regions, list):
             raise HTTPException(status_code=422, detail="regions must be a list")
         before = record.get("draft")
+        current_draft = record.get("draft") or {}
+        for field in ("schema_version", "page", "pages", "structural_regions"):
+            if field in payload and payload[field] != current_draft.get(field):
+                raise HTTPException(status_code=422, detail=f"draft {field} is authoritative and cannot be changed")
+        current_ids = [item.get("id") for item in current_draft.get("regions", [])]
+        supplied_ids = [item.get("id") for item in regions if isinstance(item, dict)]
+        if len(supplied_ids) != len(regions) or len(set(supplied_ids)) != len(supplied_ids):
+            raise HTTPException(status_code=422, detail="draft region IDs must be present and unique")
+        if set(supplied_ids) != set(current_ids):
+            raise HTTPException(status_code=422, detail="draft must preserve the complete authoritative region set")
+        previous_by_id = {item["id"]: item for item in current_draft["regions"]}
+        saved_regions = []
+        for region in regions:
+            previous = previous_by_id[region["id"]]
+            geometry_source = (
+                "human_corrected"
+                if region.get("bbox") != previous.get("bbox")
+                else previous.get("geometry_source", "PP-DocLayoutV3")
+            )
+            saved_regions.append({**region, "geometry_source": geometry_source})
         new_revision = int(record["draft_revision"]) + 1
-        record["draft"] = {**(record.get("draft") or {}), **payload, "revision": new_revision, "regions": regions}
+        record["draft"] = {
+            **current_draft,
+            "revision": new_revision,
+            "regions": saved_regions,
+            "unassigned_regions": [
+                {
+                    "region_id": item["id"],
+                    "page": item.get("page", 1),
+                    "region_type": item.get("region_type"),
+                    "bbox": item.get("bbox"),
+                    "status": "REVIEW_REQUIRED",
+                    "needs_review": True,
+                }
+                for item in saved_regions
+                if item.get("enabled", True) and item.get("review_flags")
+            ],
+        }
         record["draft_revision"] = new_revision
         record["updated_at"] = iso_now()
         store.put("registration", registration_id, record)
@@ -343,20 +387,110 @@ def create_app(
     def validate_registration_record(record: dict[str, Any]) -> list[str]:
         errors: list[str] = []
         draft = record.get("draft") or {}
-        if not draft.get("regions"):
+        identities = record.get("image_identities") or (
+            [record["image_identity"]] if record.get("image_identity") else []
+        )
+        identities_by_number = {
+            int(item["page_number"]): item
+            for item in identities
+            if isinstance(item, dict) and item.get("page_number") is not None
+        }
+        draft_pages = draft.get("pages") or (
+            [draft["page"]] if isinstance(draft.get("page"), dict) else []
+        )
+        draft_pages_by_number = {
+            int(item["page_number"]): item
+            for item in draft_pages
+            if isinstance(item, dict) and item.get("page_number") is not None
+        }
+        if draft.get("schema_version") != "1.0.0":
+            errors.append("draft schema_version must be 1.0.0")
+        if set(draft_pages_by_number) != set(identities_by_number):
+            errors.append("draft pages do not match the canonical page set")
+        for page_number, identity in identities_by_number.items():
+            page = draft_pages_by_number.get(page_number, {})
+            expected_page = {
+                "page_id": identity.get("page_id"),
+                "page_number": identity.get("page_number"),
+                "width": identity.get("width"),
+                "height": identity.get("height"),
+                "sha256": identity.get("sha256"),
+            }
+            for field, expected in expected_page.items():
+                if page.get(field) != expected:
+                    errors.append(
+                        f"draft page {page_number} {field} does not match the canonical page"
+                    )
+        regions = draft.get("regions")
+        if not isinstance(regions, list) or not regions:
             errors.append("draft has no detected fields")
+            return errors
+        layout_pages = (record.get("layout_contract") or {}).get("pages") or []
+        all_layout_regions = {
+            item["region_id"]: item
+            for layout_page in layout_pages
+            for item in layout_page.get("regions", [])
+        }
+        layout_regions = {
+            region_id: item
+            for region_id, item in all_layout_regions.items()
+            if item.get("region_type") != "TABLE_CELL"
+        }
+        draft_ids = [item.get("id") for item in regions if isinstance(item, dict)]
+        if len(draft_ids) != len(regions) or len(set(draft_ids)) != len(draft_ids):
+            errors.append("draft region IDs must be present and unique")
+        if set(draft_ids) != set(layout_regions):
+            errors.append("draft must preserve every authoritative non-cell layout region")
         keys: set[str] = set()
-        for region in draft.get("regions", []):
+        field_ids: set[str] = set()
+        enabled_count = 0
+        valid_modes = set(EXTRACTION_MODES.values()) | set(VLM_FIELD_TYPES.values())
+        for region in regions:
+            if not isinstance(region, dict):
+                continue
+            region_id = region.get("id")
+            if region.get("enabled", True) is False:
+                continue
+            enabled_count += 1
             key = str(region.get("key", ""))
             if not key:
-                errors.append(f"{region.get('id')}: key is required")
+                errors.append(f"{region_id}: key is required")
+            elif not re.fullmatch(r"[a-z][a-z0-9_]*", key):
+                errors.append(f"{region_id}: key must use lower_snake_case")
             elif key in keys:
                 errors.append(f"duplicate field key: {key}")
             keys.add(key)
-            if not region.get("bbox"):
-                errors.append(f"{region.get('id')}: geometry is required")
-            if not region.get("extraction_mode"):
-                errors.append(f"{region.get('id')}: unsupported or ambiguous field type must be resolved")
+            field_id = str(region.get("field_id") or "")
+            if not field_id:
+                errors.append(f"{region_id}: field_id is required")
+            elif field_id in field_ids:
+                errors.append(f"duplicate field ID: {field_id}")
+            field_ids.add(field_id)
+            try:
+                page_number = int(region.get("page"))
+                identity = identities_by_number[page_number]
+            except (KeyError, TypeError, ValueError):
+                errors.append(f"{region_id}: page must reference a canonical page")
+                continue
+            try:
+                normalized_xywh_to_xyxy(
+                    region.get("bbox") or {}, int(identity["width"]), int(identity["height"])
+                )
+            except (AdapterError, KeyError, TypeError, ValueError):
+                errors.append(f"{region_id}: valid in-page geometry is required")
+            if region.get("extraction_mode") not in valid_modes:
+                errors.append(f"{region_id}: unsupported or ambiguous field type must be resolved")
+            source_ids = region.get("source_region_ids")
+            if (
+                not isinstance(source_ids, list)
+                or not source_ids
+                or any(item not in all_layout_regions for item in source_ids)
+            ):
+                errors.append(f"{region_id}: source_region_ids must reference authoritative layout regions")
+            for flag in region.get("review_flags") or []:
+                errors.append(f"{region_id}: unresolved review flag: {flag}")
+        if enabled_count == 0:
+            errors.append("draft must contain at least one enabled field")
         return errors
 
     @app.post("/api/v1/template-registrations/{registration_id}/validate", tags=["templates"])
