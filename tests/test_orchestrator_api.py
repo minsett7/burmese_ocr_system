@@ -500,7 +500,7 @@ def test_preprocessing_policy_is_mapped_and_decision_is_persisted(
 
     response = test_client.post(
         "/api/v1/template-registrations",
-        data={"form_type_id": "motor", "preprocessing_policy": policy},
+        data={"name": "Policy test form", "form_type_id": "motor", "preprocessing_policy": policy},
         files={"file": ("blank.png", page, "image/png")},
     )
 
@@ -537,7 +537,7 @@ def test_failed_capture_stops_before_layout_ocr_and_vlm(client):
 
     response = test_client.post(
         "/api/v1/template-registrations",
-        data={"form_type_id": "motor", "preprocessing_policy": "auto"},
+        data={"name": "Blurry form", "form_type_id": "motor", "preprocessing_policy": "auto"},
         files={"file": ("blurry.png", png_bytes(), "image/png")},
     )
 
@@ -566,7 +566,7 @@ def test_missing_authoritative_preprocessing_decision_fails_contract(client):
 
     response = test_client.post(
         "/api/v1/template-registrations",
-        data={"form_type_id": "motor", "preprocessing_policy": "auto"},
+        data={"name": "Contract test form", "form_type_id": "motor", "preprocessing_policy": "auto"},
         files={"file": ("blank.png", png_bytes(), "image/png")},
     )
 
@@ -590,7 +590,7 @@ def test_invalid_preprocessing_policy_is_rejected(client):
 
     response = test_client.post(
         "/api/v1/template-registrations",
-        data={"form_type_id": "motor", "preprocessing_policy": "aggressive"},
+        data={"name": "Invalid policy form", "form_type_id": "motor", "preprocessing_policy": "aggressive"},
         files={"file": ("blank.png", png_bytes(), "image/png")},
     )
 
@@ -604,7 +604,7 @@ def test_none_policy_still_blocks_manifest_quality_failure(client):
 
     response = test_client.post(
         "/api/v1/template-registrations",
-        data={"form_type_id": "motor", "preprocessing_policy": "none"},
+        data={"name": "Scanner form", "form_type_id": "motor", "preprocessing_policy": "none"},
         files={"file": ("blurry-scanner.png", png_bytes(), "image/png")},
     )
 
@@ -631,7 +631,7 @@ def test_canonical_page_is_established_before_layout_and_ocr(client):
 
     response = test_client.post(
         "/api/v1/template-registrations",
-        data={"form_type_id": "motor", "preprocessing_policy": "auto"},
+        data={"name": "Canonical form", "form_type_id": "motor", "preprocessing_policy": "auto"},
         files={"file": ("blank.png", fake.page, "image/png")},
     )
 
@@ -703,7 +703,7 @@ def test_draft_preserves_authoritative_metadata_and_tracks_human_geometry(client
     test_client, _ = client
     response = test_client.post(
         "/api/v1/template-registrations",
-        data={"form_type_id": "motor"},
+        data={"name": "Geometry form", "form_type_id": "motor"},
         files={"file": ("blank.png", png_bytes(), "image/png")},
     )
     registration_id = response.json()["id"]
@@ -740,7 +740,7 @@ def test_unresolved_review_flag_blocks_approval_until_cleared(client):
     test_client, _ = client
     response = test_client.post(
         "/api/v1/template-registrations",
-        data={"form_type_id": "motor"},
+        data={"name": "Review form", "form_type_id": "motor"},
         files={"file": ("blank.png", png_bytes(), "image/png")},
     )
     registration_id = response.json()["id"]
@@ -836,7 +836,7 @@ def test_canonical_identity_mismatch_prevents_vlm_submission(client):
 
     response = test_client.post(
         "/api/v1/template-registrations",
-        data={"form_type_id": "motor", "preprocessing_policy": "auto"},
+        data={"name": "Identity form", "form_type_id": "motor", "preprocessing_policy": "auto"},
         files={"file": ("blank.png", fake.page, "image/png")},
     )
 
@@ -871,7 +871,7 @@ def test_branch_failure_is_observable_and_prevents_vlm(
 
     response = test_client.post(
         "/api/v1/template-registrations",
-        data={"form_type_id": "motor"},
+        data={"name": "Failure form", "form_type_id": "motor"},
         files={"file": ("blank.png", fake.page, "image/png")},
     )
 
@@ -887,3 +887,93 @@ def test_branch_failure_is_observable_and_prevents_vlm(
     assert registration["failure"]["service"] == failure_service
     attempted = {(request.method, request.url.path) for request in fake.requests}
     assert ("POST", "/api/v1/registrations") not in attempted
+
+
+def test_user_managed_category_and_draft_metadata_lifecycle(client):
+    test_client, _ = client
+    initial = test_client.get("/api/v1/form-categories")
+    assert initial.status_code == 200
+    assert {item["id"] for item in initial.json()} >= {"health", "life", "motor", "fire"}
+
+    created = test_client.post(
+        "/api/v1/form-categories",
+        json={"name": "Travel Claim", "description": "International travel forms"},
+    )
+    assert created.status_code == 201, created.text
+    category = created.json()
+    assert category["system"] is False
+
+    duplicate = test_client.post(
+        "/api/v1/form-categories",
+        json={"name": "travel claim", "description": "Duplicate"},
+    )
+    assert duplicate.status_code == 409
+
+    upload = test_client.post(
+        "/api/v1/template-registrations",
+        data={
+            "name": "Overseas medical reimbursement",
+            "description": "Blank two-language travel reimbursement form",
+            "form_type_id": category["id"],
+        },
+        files={"file": ("travel.png", png_bytes(), "image/png")},
+    )
+    assert upload.status_code == 202, upload.text
+    registration_id = upload.json()["id"]
+    registration = test_client.get(
+        f"/api/v1/template-registrations/{registration_id}"
+    ).json()
+    assert registration["name"] == "Overseas medical reimbursement"
+    assert registration["description"] == "Blank two-language travel reimbursement form"
+    assert registration["form_type_id"] == category["id"]
+
+    in_use = test_client.delete(f"/api/v1/form-categories/{category['id']}")
+    assert in_use.status_code == 409
+
+    updated_category = test_client.patch(
+        f"/api/v1/form-categories/{category['id']}",
+        json={"name": "International Travel Claim", "description": "Travel and emergency forms"},
+    )
+    assert updated_category.status_code == 200
+    assert updated_category.json()["name"] == "International Travel Claim"
+
+    updated_form = test_client.patch(
+        f"/api/v1/template-registrations/{registration_id}",
+        json={
+            "name": "Travel reimbursement form",
+            "description": "Reviewer-facing description",
+            "form_type_id": category["id"],
+        },
+    )
+    assert updated_form.status_code == 200, updated_form.text
+    assert updated_form.json()["name"] == "Travel reimbursement form"
+    assert updated_form.json()["description"] == "Reviewer-facing description"
+
+    removed = test_client.delete(f"/api/v1/template-registrations/{registration_id}")
+    assert removed.status_code == 204
+    assert test_client.get(f"/api/v1/template-registrations/{registration_id}").status_code == 404
+    assert test_client.delete(f"/api/v1/form-categories/{category['id']}").status_code == 204
+
+
+def test_approved_template_metadata_tracks_registration_and_archive(client):
+    test_client, _ = client
+    registration_id, template = register_and_approve(test_client)
+
+    updated = test_client.patch(
+        f"/api/v1/template-registrations/{registration_id}",
+        json={
+            "name": "Renamed motor claim form",
+            "description": "Used by the claims operations team",
+            "form_type_id": "motor",
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    saved_template = test_client.get(f"/api/templates/{template['id']}").json()
+    assert saved_template["name"] == "Renamed motor claim form"
+    assert saved_template["description"] == "Used by the claims operations team"
+
+    archived = test_client.delete(f"/api/v1/templates/{template['id']}")
+    assert archived.status_code == 204
+    assert test_client.get(f"/api/templates/{template['id']}").status_code == 404
+    assert test_client.get(f"/api/v1/template-registrations/{registration_id}").status_code == 404
+    assert all(item["id"] != template["id"] for item in test_client.get("/api/templates").json())

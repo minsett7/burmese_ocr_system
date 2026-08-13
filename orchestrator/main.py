@@ -37,14 +37,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("orchestrator")
 
-FORM_TYPES = [
-    {"id": "health", "name": "Health", "label": "Health Claim"},
-    {"id": "life", "name": "Life", "label": "Life Claim"},
-    {"id": "motor", "name": "Motor", "label": "Motor Claim"},
-    {"id": "fire", "name": "Fire", "label": "Fire Claim"},
+DEFAULT_FORM_CATEGORIES = [
+    {"id": "health", "name": "Health Claim", "description": "Health insurance claim forms"},
+    {"id": "life", "name": "Life Claim", "description": "Life insurance claim forms"},
+    {"id": "motor", "name": "Motor Claim", "description": "Motor and vehicle insurance claim forms"},
+    {"id": "fire", "name": "Fire Claim", "description": "Fire insurance claim forms"},
 ]
 VALID_PREPROCESSING_POLICIES = {"auto", "force", "none"}
-VALID_FORM_TYPES = {item["id"] for item in FORM_TYPES}
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$")
 
 
@@ -97,6 +96,21 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         store.initialize()
+        now = iso_now()
+        for category in DEFAULT_FORM_CATEGORIES:
+            if store.get("category", category["id"]) is None:
+                store.put(
+                    "category",
+                    category["id"],
+                    {
+                        **category,
+                        "label": category["name"],
+                        "system": True,
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                    create_only=True,
+                )
         yield
         engine.dispose()
 
@@ -190,12 +204,35 @@ def create_app(
                 results[name] = {"status": "unavailable", "error": exc.message}
         return {"status": "ok" if all(item["status"] == "available" for item in results.values()) else "degraded", "services": results}
 
+    def category_or_404(category_id: str) -> dict[str, Any]:
+        return _record_or_404(store, "category", category_id)
+
+    def clean_metadata_text(value: Any, field: str, *, maximum: int, allow_empty: bool = False) -> str:
+        if not isinstance(value, str):
+            raise HTTPException(status_code=422, detail=f"{field} must be a string")
+        cleaned = value.strip()
+        if not allow_empty and not cleaned:
+            raise HTTPException(status_code=422, detail=f"{field} is required")
+        if len(cleaned) > maximum:
+            raise HTTPException(status_code=422, detail=f"{field} must be at most {maximum} characters")
+        return cleaned
+
+    def validate_category_name(name: Any, *, exclude_id: str | None = None) -> str:
+        cleaned = clean_metadata_text(name, "name", maximum=100)
+        for category in store.list("category"):
+            if category.get("deleted_at") or category.get("id") == exclude_id:
+                continue
+            if str(category.get("name", "")).casefold() == cleaned.casefold():
+                raise HTTPException(status_code=409, detail="a category with this name already exists")
+        return cleaned
+
     def create_registration_record(
-        *, content: bytes, filename: str, name: str, form_type_id: str, language: str,
+        *, content: bytes, filename: str, name: str, description: str, form_type_id: str, language: str,
         version_note: str | None, preprocessing_policy: str, correlation_id: str
     ) -> dict[str, Any]:
-        if form_type_id not in VALID_FORM_TYPES:
-            raise HTTPException(status_code=422, detail="unknown form_type_id")
+        category_or_404(form_type_id)
+        name = clean_metadata_text(name, "name", maximum=160)
+        description = clean_metadata_text(description, "description", maximum=2000, allow_empty=True)
         if preprocessing_policy not in VALID_PREPROCESSING_POLICIES:
             raise HTTPException(
                 status_code=422,
@@ -208,6 +245,7 @@ def create_app(
             "id": registration_id,
             "template_id": None,
             "name": name,
+            "description": description,
             "form_type_id": form_type_id,
             "language": language,
             "version_note": version_note,
@@ -249,6 +287,8 @@ def create_app(
             correlation_id=correlation_id,
             after={
                 "file_name": filename,
+                "name": name,
+                "description": description,
                 "form_type_id": form_type_id,
                 "source_sha256": record["source_sha256"],
                 "preprocessing_policy": preprocessing_policy,
@@ -261,7 +301,8 @@ def create_app(
         request: Request,
         background_tasks: BackgroundTasks,
         file: UploadFile = File(...),
-        name: str = Form("Insurance Claim Template"),
+        name: str = Form(...),
+        description: str = Form(""),
         form_type_id: str = Form("motor"),
         language: str = Form("my-en"),
         version_note: str | None = Form(None),
@@ -272,6 +313,7 @@ def create_app(
             content=content,
             filename=file.filename or "template",
             name=name,
+            description=description,
             form_type_id=form_type_id,
             language=language,
             preprocessing_policy=preprocessing_policy,
@@ -288,11 +330,13 @@ def create_app(
         file: UploadFile = File(...),
         preprocessing_policy: str = Form("auto"),
         name: str = Form("Insurance Claim Template"),
+        description: str = Form(""),
         form_type_id: str = Form("motor"),
     ) -> dict[str, Any]:
         content = await _read_upload(file, configured)
         record = create_registration_record(
-            content=content, filename=file.filename or "template", name=name, form_type_id=form_type_id,
+            content=content, filename=file.filename or "template", name=name, description=description,
+            form_type_id=form_type_id,
             language="my-en", version_note=None, preprocessing_policy=preprocessing_policy,
             correlation_id=request.state.correlation_id,
         )
@@ -303,6 +347,77 @@ def create_app(
     @app.get("/api/v1/templates/jobs/{registration_id}", tags=["templates"])
     async def get_registration(registration_id: str) -> dict[str, Any]:
         return _record_or_404(store, "registration", registration_id)
+
+    @app.patch("/api/v1/template-registrations/{registration_id}", tags=["templates"])
+    @app.patch("/api/template-registrations/{registration_id}", tags=["compatibility"])
+    async def update_registration_metadata(
+        registration_id: str,
+        request: Request,
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        record = _record_or_404(store, "registration", registration_id)
+        if record.get("status") not in {"needs_approval", "needs_resubmission", "failed", "registered"}:
+            raise HTTPException(status_code=409, detail="wait for template analysis to finish before editing metadata")
+        allowed = {"name", "description", "form_type_id"}
+        if not any(field in payload for field in allowed):
+            raise HTTPException(status_code=422, detail="provide name, description, or form_type_id")
+        before = {field: record.get(field) for field in allowed}
+        if "name" in payload:
+            record["name"] = clean_metadata_text(payload["name"], "name", maximum=160)
+        if "description" in payload:
+            record["description"] = clean_metadata_text(
+                payload["description"], "description", maximum=2000, allow_empty=True
+            )
+        if "form_type_id" in payload:
+            category_or_404(str(payload["form_type_id"]))
+            record["form_type_id"] = str(payload["form_type_id"])
+        record["updated_at"] = iso_now()
+        store.put("registration", registration_id, record)
+        if record.get("template_id"):
+            template = store.get("template", record["template_id"])
+            if template and not template.get("deleted_at"):
+                template.update({field: record.get(field) for field in allowed})
+                template["updated_at"] = record["updated_at"]
+                store.put("template", template["id"], template)
+        store.add_audit(
+            action="updated template metadata",
+            target_type="template_registration",
+            target_id=registration_id,
+            actor=request.headers.get("X-Actor", "reviewer"),
+            before=before,
+            after={field: record.get(field) for field in allowed},
+            correlation_id=request.state.correlation_id,
+        )
+        return record
+
+    @app.delete("/api/v1/template-registrations/{registration_id}", status_code=204, tags=["templates"])
+    @app.delete("/api/template-registrations/{registration_id}", status_code=204, tags=["compatibility"])
+    async def archive_registration(registration_id: str, request: Request) -> Response:
+        record = _record_or_404(store, "registration", registration_id)
+        if record.get("status") not in {"needs_approval", "needs_resubmission", "failed", "registered"}:
+            raise HTTPException(status_code=409, detail="wait for template analysis to finish before removing it")
+        now = iso_now()
+        record["deleted_at"] = now
+        record["archived_status"] = record.get("status")
+        record["status"] = "archived"
+        record["updated_at"] = now
+        store.put("registration", registration_id, record)
+        if record.get("template_id"):
+            template = store.get("template", record["template_id"])
+            if template and not template.get("deleted_at"):
+                template["deleted_at"] = now
+                template["status"] = "archived"
+                template["updated_at"] = now
+                store.put("template", template["id"], template)
+        store.add_audit(
+            action="archived template registration",
+            target_type="template_registration",
+            target_id=registration_id,
+            actor=request.headers.get("X-Actor", "reviewer"),
+            correlation_id=request.state.correlation_id,
+            after={"deleted_at": now, "template_id": record.get("template_id")},
+        )
+        return Response(status_code=204)
 
     @app.get("/api/v1/templates/jobs/{registration_id}/result", tags=["templates"])
     async def get_registration_result(registration_id: str) -> dict[str, Any]:
@@ -518,9 +633,102 @@ def create_app(
     async def approve_registration(registration_id: str, request: Request) -> dict[str, Any]:
         return await approve_registration_common(registration_id, request)
 
+    @app.get("/api/v1/form-categories", tags=["categories"])
     @app.get("/api/form-types", tags=["compatibility"])
-    async def form_types() -> list[dict[str, str]]:
-        return FORM_TYPES
+    async def form_categories() -> list[dict[str, Any]]:
+        return [
+            item
+            for item in sorted(store.list("category"), key=lambda value: str(value.get("name", "")).casefold())
+            if not item.get("deleted_at")
+        ]
+
+    @app.post("/api/v1/form-categories", status_code=201, tags=["categories"])
+    async def create_form_category(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        name = validate_category_name(payload.get("name"))
+        description = clean_metadata_text(
+            payload.get("description", ""), "description", maximum=1000, allow_empty=True
+        )
+        category_id = _id("CAT")
+        now = iso_now()
+        category = {
+            "id": category_id,
+            "name": name,
+            "label": name,
+            "description": description,
+            "system": False,
+            "created_at": now,
+            "updated_at": now,
+        }
+        store.put("category", category_id, category, create_only=True)
+        store.add_audit(
+            action="created form category",
+            target_type="form_category",
+            target_id=category_id,
+            actor=request.headers.get("X-Actor", "reviewer"),
+            correlation_id=request.state.correlation_id,
+            after=category,
+        )
+        return category
+
+    @app.patch("/api/v1/form-categories/{category_id}", tags=["categories"])
+    async def update_form_category(
+        category_id: str,
+        request: Request,
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        category = category_or_404(category_id)
+        if "name" not in payload and "description" not in payload:
+            raise HTTPException(status_code=422, detail="provide name or description")
+        before = {"name": category.get("name"), "description": category.get("description", "")}
+        if "name" in payload:
+            category["name"] = validate_category_name(payload["name"], exclude_id=category_id)
+            category["label"] = category["name"]
+        if "description" in payload:
+            category["description"] = clean_metadata_text(
+                payload["description"], "description", maximum=1000, allow_empty=True
+            )
+        category["updated_at"] = iso_now()
+        store.put("category", category_id, category)
+        store.add_audit(
+            action="updated form category",
+            target_type="form_category",
+            target_id=category_id,
+            actor=request.headers.get("X-Actor", "reviewer"),
+            before=before,
+            after={"name": category["name"], "description": category.get("description", "")},
+            correlation_id=request.state.correlation_id,
+        )
+        return category
+
+    @app.delete("/api/v1/form-categories/{category_id}", status_code=204, tags=["categories"])
+    async def archive_form_category(category_id: str, request: Request) -> Response:
+        category = category_or_404(category_id)
+        used_by_registrations = any(
+            not item.get("deleted_at") and item.get("form_type_id") == category_id
+            for item in store.list("registration")
+        )
+        used_by_templates = any(
+            not item.get("deleted_at") and item.get("form_type_id") == category_id
+            for item in store.list("template")
+        )
+        if used_by_registrations or used_by_templates:
+            raise HTTPException(
+                status_code=409,
+                detail="category is in use; move or remove its forms before deleting it",
+            )
+        now = iso_now()
+        category["deleted_at"] = now
+        category["updated_at"] = now
+        store.put("category", category_id, category)
+        store.add_audit(
+            action="archived form category",
+            target_type="form_category",
+            target_id=category_id,
+            actor=request.headers.get("X-Actor", "reviewer"),
+            correlation_id=request.state.correlation_id,
+            after={"deleted_at": now},
+        )
+        return Response(status_code=204)
 
     @app.get("/api/templates", tags=["compatibility"])
     async def list_templates() -> list[dict[str, Any]]:
@@ -529,6 +737,73 @@ def create_app(
     @app.get("/api/templates/{template_id}", tags=["compatibility"])
     async def get_template(template_id: str) -> dict[str, Any]:
         return _record_or_404(store, "template", template_id)
+
+    @app.patch("/api/v1/templates/{template_id}", tags=["templates"])
+    @app.patch("/api/templates/{template_id}", tags=["compatibility"])
+    async def update_template_metadata(
+        template_id: str,
+        request: Request,
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        template = _record_or_404(store, "template", template_id)
+        allowed = {"name", "description", "form_type_id"}
+        if not any(field in payload for field in allowed):
+            raise HTTPException(status_code=422, detail="provide name, description, or form_type_id")
+        before = {field: template.get(field) for field in allowed}
+        if "name" in payload:
+            template["name"] = clean_metadata_text(payload["name"], "name", maximum=160)
+        if "description" in payload:
+            template["description"] = clean_metadata_text(
+                payload["description"], "description", maximum=2000, allow_empty=True
+            )
+        if "form_type_id" in payload:
+            category_or_404(str(payload["form_type_id"]))
+            template["form_type_id"] = str(payload["form_type_id"])
+        template["updated_at"] = iso_now()
+        store.put("template", template_id, template)
+        for registration in store.list("registration"):
+            if registration.get("template_id") == template_id and not registration.get("deleted_at"):
+                registration.update({field: template.get(field) for field in allowed})
+                registration["updated_at"] = template["updated_at"]
+                store.put("registration", registration["id"], registration)
+        store.add_audit(
+            action="updated approved template metadata",
+            target_type="template",
+            target_id=template_id,
+            actor=request.headers.get("X-Actor", "reviewer"),
+            before=before,
+            after={field: template.get(field) for field in allowed},
+            correlation_id=request.state.correlation_id,
+            template_version=template.get("version_id"),
+        )
+        return template
+
+    @app.delete("/api/v1/templates/{template_id}", status_code=204, tags=["templates"])
+    @app.delete("/api/templates/{template_id}", status_code=204, tags=["compatibility"])
+    async def archive_template(template_id: str, request: Request) -> Response:
+        template = _record_or_404(store, "template", template_id)
+        now = iso_now()
+        template["deleted_at"] = now
+        template["status"] = "archived"
+        template["updated_at"] = now
+        store.put("template", template_id, template)
+        for registration in store.list("registration"):
+            if registration.get("template_id") == template_id and not registration.get("deleted_at"):
+                registration["deleted_at"] = now
+                registration["archived_status"] = registration.get("status")
+                registration["status"] = "archived"
+                registration["updated_at"] = now
+                store.put("registration", registration["id"], registration)
+        store.add_audit(
+            action="archived approved template",
+            target_type="template",
+            target_id=template_id,
+            actor=request.headers.get("X-Actor", "reviewer"),
+            correlation_id=request.state.correlation_id,
+            template_version=template.get("version_id"),
+            after={"deleted_at": now},
+        )
+        return Response(status_code=204)
 
     @app.get("/api/template-registrations", tags=["compatibility"])
     async def list_registrations() -> list[dict[str, Any]]:
@@ -550,6 +825,8 @@ def create_app(
         request: Request,
         background_tasks: BackgroundTasks,
         form_type_id: str = Query(...),
+        name: str | None = Query(None),
+        description: str = Query(""),
         preprocessing_policy: str = Query("auto"),
         files: list[UploadFile] = File(...),
     ) -> dict[str, Any]:
@@ -557,8 +834,9 @@ def create_app(
         for upload in files:
             content = await _read_upload(upload, configured)
             item = create_registration_record(
-                content=content, filename=upload.filename or "template", name=f"{form_type_id.title()} Claim Template",
-                form_type_id=form_type_id, language="my-en", version_note=None,
+                content=content, filename=upload.filename or "template",
+                name=name or Path(upload.filename or "template").stem,
+                description=description, form_type_id=form_type_id, language="my-en", version_note=None,
                 preprocessing_policy=preprocessing_policy, correlation_id=request.state.correlation_id,
             )
             background_tasks.add_task(workflows.run_template_registration, item["id"])

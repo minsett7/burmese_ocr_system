@@ -247,6 +247,42 @@ The desktop firewall should restrict TCP 8081 to the VM address. Do not publish 
 
 ## Template registration and approval
 
+### Categories and form metadata
+
+Form categories are database records, not a fixed enum. The first startup seeds Health Claim,
+Life Claim, Motor Claim, and Fire Claim for compatibility, but users can create any additional
+category through the Templates screen or the API:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/form-categories \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Travel Claim","description":"Travel and emergency insurance forms"}'
+
+curl http://localhost:8000/api/v1/form-categories
+```
+
+Category IDs are stable. Renaming a category changes its display name without rewriting every
+registration/template reference. A category cannot be removed while a non-archived draft or
+approved template still uses it; move or remove those forms first.
+
+Every canonical registration upload supplies `name`, optional `description`, and
+`form_type_id` alongside the file:
+
+```bash
+curl -F 'file=@data/Vehicle Damage Claim Form.pdf' \
+  -F 'name=Vehicle damage claim form' \
+  -F 'description=Blank two-page form used for motor damage claims' \
+  -F 'form_type_id=motor' \
+  http://localhost:8000/api/v1/template-registrations
+```
+
+Drafts and approved forms can be renamed, described, or moved to another category with
+`PATCH /api/v1/template-registrations/{id}`. Approved templates also support
+`PATCH /api/v1/templates/{id}`. Removing a form uses `DELETE` on the same resource. Removal is a
+soft archive: list/get endpoints stop returning the form and it cannot process new documents,
+but database history, immutable versions, audit records, source files, and prior document records
+are retained.
+
 Canonical API flow:
 
 1. `POST /api/v1/template-registrations` (or legacy `POST /api/v1/templates/register`) uploads one blank form file. The file can be a multi-page PDF.
@@ -268,6 +304,8 @@ Upload the PDF as one file and poll the returned registration ID:
 
 ```bash
 curl -F 'file=@data/Vehicle Damage Claim Form.pdf' \
+  -F 'name=Vehicle damage claim form' \
+  -F 'description=Blank two-page motor claim form' \
   -F 'form_type_id=motor' \
   http://localhost:8000/api/v1/template-registrations
 

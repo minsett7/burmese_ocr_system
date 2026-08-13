@@ -922,6 +922,7 @@ class WorkflowService:
         template = {
             "id": template_id,
             "name": record.get("name") or f"{record['form_type_id'].title()} Claim Template",
+            "description": record.get("description", ""),
             "form_type_id": record["form_type_id"],
             "version": str(revision),
             "version_id": version_id,

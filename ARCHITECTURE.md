@@ -23,6 +23,28 @@ The prototype backend in `services/insurance-claim-ui/backend` is available only
 | Orchestrator | Correlation, workflow state, strict adapters, approval, immutable template versions, compatibility API, audit | Layout/OCR/VLM inference logic |
 | React/Vite frontend | Human workflow and correction UI | Backend persistence or mock production processing |
 
+## Form catalog and lifecycle
+
+The orchestrator's durable record store also owns the user-managed form catalog:
+
+```text
+category (stable ID, mutable name/description)
+   └── registration (source metadata, pipeline state, editable draft)
+          └── template (current approved catalog entry)
+                 └── template_version (immutable approved extraction definition)
+```
+
+The four initial insurance categories are seeded records only; request validation resolves a
+category ID from storage and therefore accepts user-created categories. Category renames do not
+change referenced IDs. Deletion is blocked while an active registration or template references
+the category.
+
+Registration/template names, descriptions, and category assignments are mutable catalog
+metadata. Updating the metadata of an approved registration synchronizes its current `template`
+record, while `template_version.definition` remains immutable. Archiving a registration also
+archives its linked approved template. Archiving an approved template also hides its linked
+registration. Artifacts, versions, audits, and historical documents are deliberately retained.
+
 ## Blank-template registration sequence
 
 ```mermaid
@@ -195,6 +217,7 @@ The adapter maps known VLM data types and reviewer-selected extraction modes. Un
 | Data | Storage | Notes |
 |---|---|---|
 | Orchestrator registrations, templates, immutable versions, documents, audit | PostgreSQL `orchestrator_records` JSON records | Durable across orchestrator restarts |
+| Form categories | PostgreSQL `orchestrator_records` records with `kind=category` | Stable IDs; user-managed names/descriptions; initial four are seeded |
 | Orchestrator source/canonical page files | `orchestrator_artifacts` volume | Sensitive; back up with database |
 | Visual metadata | PostgreSQL | Visual service runs its own migrations |
 | Visual originals, pages, crops, overlays, manifests | `visual_field_data` volume | Paths/hashes are referenced by database rows |
