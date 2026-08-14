@@ -308,6 +308,16 @@ class WorkflowService:
             json=definition,
         )
         registered_definition = response.json()
+        reference_path = self.settings.storage_root / registration_id / "page_001.png"
+        if not reference_path.is_file():
+            raise AdapterError("Approved template is missing its canonical reference page")
+        await self.client.request(
+            "document-processing-layer",
+            "POST",
+            f"{self.settings.document_processing_url}/api/v1/templates/{pinned_id}/reference",
+            correlation_id=correlation_id,
+            files={"file": ("page_001.png", reference_path.read_bytes(), "image/png")},
+        )
         now = iso_now()
         version_id = f"{template_id}:v{revision}"
         version = {
@@ -316,6 +326,7 @@ class WorkflowService:
             "version": str(revision),
             "definition": registered_definition,
             "draft_snapshot": record["draft"],
+            "reference_image_path": str(reference_path),
             "approved_at": now,
             "approved_by": actor,
             "immutable": True,
@@ -373,6 +384,17 @@ class WorkflowService:
                 f"{self.settings.document_processing_url}/api/v1/templates/register",
                 correlation_id=correlation_id,
                 json=definition,
+            )
+            reference_image_path = template_version.get("reference_image_path")
+            if not isinstance(reference_image_path, str) or not Path(reference_image_path).is_file():
+                raise AdapterError("approved template version is missing its canonical reference image")
+            reference_path = Path(reference_image_path)
+            await self.client.request(
+                "document-processing-layer",
+                "POST",
+                f"{self.settings.document_processing_url}/api/v1/templates/{template['downstream_template_id']}/reference",
+                correlation_id=correlation_id,
+                files={"file": ("page_001.png", reference_path.read_bytes(), "image/png")},
             )
             record["status"] = "processing"
             record["progress"] = {"stage": "document_processing", "percent": 35}

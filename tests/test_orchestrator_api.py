@@ -32,6 +32,7 @@ class FakeDownstreams:
     def __init__(self):
         self.page = png_bytes()
         self.registered_templates = []
+        self.registered_references = []
         self.processed_documents = 0
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -100,6 +101,9 @@ class FakeDownstreams:
             definition = json.loads(request.content)
             self.registered_templates.append(definition)
             return httpx.Response(201, json=definition)
+        if method == "POST" and path.startswith("/api/v1/templates/") and path.endswith("/reference"):
+            self.registered_references.append(path)
+            return httpx.Response(201, json={"stored": True})
         if method == "POST" and path == "/api/v1/documents/process":
             self.processed_documents += 1
             return httpx.Response(

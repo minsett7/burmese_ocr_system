@@ -99,6 +99,12 @@ def register_definition(payload: dict[str, Any]):
     return payload
 
 
+@app.post("/api/v1/templates/{template_id}/reference", status_code=201)
+async def register_template_reference(template_id: str, file: UploadFile = File(...)):
+    await file.read()
+    return {"template_id": template_id, "stored": True}
+
+
 @app.post("/api/v1/documents/process")
 async def process_document(file: UploadFile = File(...), template_id: str = Form(...)):
     await file.read()
