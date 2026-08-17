@@ -736,7 +736,7 @@ def test_draft_preserves_authoritative_metadata_and_tracks_human_geometry(client
     assert updated["regions"][0]["geometry_source"] == "human_corrected"
 
 
-def test_unresolved_review_flag_blocks_approval_until_cleared(client):
+def test_structured_review_requirement_blocks_approval_until_cleared(client):
     test_client, _ = client
     response = test_client.post(
         "/api/v1/template-registrations",
@@ -748,7 +748,8 @@ def test_unresolved_review_flag_blocks_approval_until_cleared(client):
         f"/api/v1/template-registrations/{registration_id}"
     ).json()
     regions = [dict(item) for item in registration["draft"]["regions"]]
-    regions[0]["review_flags"] = ["Reviewer must confirm this mapping"]
+    regions[0]["review_required"] = True
+    regions[0]["review_reasons"] = ["Reviewer must confirm this mapping"]
     saved = test_client.put(
         f"/api/v1/template-registrations/{registration_id}/draft",
         json={"revision": 1, "regions": regions},
@@ -759,13 +760,14 @@ def test_unresolved_review_flag_blocks_approval_until_cleared(client):
         f"/api/v1/template-registrations/{registration_id}/validate"
     ).json()
     assert validation["valid"] is False
-    assert "unresolved review flag" in validation["errors"][0]
+    assert "unresolved review requirement" in validation["errors"][0]
     blocked = test_client.post(
         f"/api/v1/template-registrations/{registration_id}/approve"
     )
     assert blocked.status_code == 422
 
-    regions[0]["review_flags"] = []
+    regions[0]["review_required"] = False
+    regions[0]["review_reasons"] = []
     cleared = test_client.put(
         f"/api/v1/template-registrations/{registration_id}/draft",
         json={"revision": 2, "regions": regions},

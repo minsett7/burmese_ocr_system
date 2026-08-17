@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import logging
+import mimetypes
 import re
 import uuid
 from contextlib import asynccontextmanager
@@ -484,9 +485,10 @@ def create_app(
                     "bbox": item.get("bbox"),
                     "status": "REVIEW_REQUIRED",
                     "needs_review": True,
+                    "review_reasons": item.get("review_reasons", item.get("review_flags", [])),
                 }
                 for item in saved_regions
-                if item.get("enabled", True) and item.get("review_flags")
+                if item.get("enabled", True) and item.get("review_required", bool(item.get("review_flags")))
             ],
         }
         record["draft_revision"] = new_revision
@@ -602,8 +604,12 @@ def create_app(
                 or any(item not in all_layout_regions for item in source_ids)
             ):
                 errors.append(f"{region_id}: source_region_ids must reference authoritative layout regions")
-            for flag in region.get("review_flags") or []:
-                errors.append(f"{region_id}: unresolved review flag: {flag}")
+            if region.get("review_required", bool(region.get("review_flags"))):
+                reasons = region.get("review_reasons", region.get("review_flags", []))
+                if not isinstance(reasons, list) or not reasons:
+                    reasons = ["human review is required"]
+                for reason in reasons:
+                    errors.append(f"{region_id}: unresolved review requirement: {reason}")
         if enabled_count == 0:
             errors.append("draft must contain at least one enabled field")
         return errors
@@ -737,6 +743,18 @@ def create_app(
     @app.get("/api/templates/{template_id}", tags=["compatibility"])
     async def get_template(template_id: str) -> dict[str, Any]:
         return _record_or_404(store, "template", template_id)
+
+    @app.get("/api/v1/templates/{template_id}/layout", tags=["templates"])
+    async def get_template_layout(template_id: str) -> dict[str, Any]:
+        template = _record_or_404(store, "template", template_id)
+        version = _record_or_404(store, "template_version", template["version_id"])
+        draft = version.get("draft_snapshot") or {}
+        return {
+            "template_id": template_id,
+            "version": version["version"],
+            "pages": draft.get("pages") or ([draft["page"]] if isinstance(draft.get("page"), dict) else []),
+            "regions": draft.get("regions") or [],
+        }
 
     @app.patch("/api/v1/templates/{template_id}", tags=["templates"])
     @app.patch("/api/templates/{template_id}", tags=["compatibility"])
@@ -898,7 +916,7 @@ def create_app(
             "sync_status": "not_synced",
             "review_status": "pending",
             "processed": None,
-            "pages": 1,
+            "pages": int(template.get("pages") or 1),
             "progress": {"stage": "queued", "percent": 0},
             "template_match": {"template_id": template_id, "version": template["version"], "score": 1.0 if confirmed else 0.5, "confirmed": confirmed},
             "extraction_attempts": [],
@@ -954,6 +972,38 @@ def create_app(
     async def canonical_get_document(document_id: str) -> dict[str, Any]:
         return _record_or_404(store, "document", document_id)
 
+    @app.get("/api/v1/documents/{document_id}/source", tags=["documents"])
+    async def document_source(document_id: str) -> FileResponse:
+        document = _record_or_404(store, "document", document_id)
+        source_path = Path(str(document.get("source_path") or ""))
+        storage_root = configured.storage_root.resolve()
+        if not source_path.is_file() or storage_root not in source_path.resolve().parents:
+            raise HTTPException(status_code=404, detail="uploaded source file is unavailable")
+        return FileResponse(
+            source_path,
+            media_type=mimetypes.guess_type(document["file_name"])[0] or "application/octet-stream",
+            filename=document["file_name"],
+            content_disposition_type="inline",
+        )
+
+    @app.get("/api/v1/documents/{document_id}/pages/{page_number}", tags=["documents"])
+    async def aligned_document_page(document_id: str, page_number: int, request: Request) -> Response:
+        """Proxies the exact aligned page used by OCR so review boxes share its coordinates."""
+        document = _record_or_404(store, "document", document_id)
+        job_id = (document.get("downstream_ids") or {}).get("document_job_id")
+        if not job_id:
+            raise HTTPException(status_code=409, detail="document has not produced aligned review pages yet")
+        try:
+            response = await workflows.client.request(
+                "document-processing-layer",
+                "GET",
+                f"{configured.document_processing_url}/api/v1/documents/jobs/{job_id}/pages/{page_number}",
+                correlation_id=request.state.correlation_id,
+            )
+        except DownstreamError as exc:
+            raise HTTPException(status_code=502, detail=exc.message) from exc
+        return Response(content=response.content, media_type=response.headers.get("content-type", "image/png"))
+
     @app.post("/api/v1/documents/{document_id}/template-match", tags=["documents"])
     async def override_template_match(document_id: str, request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         document = _record_or_404(store, "document", document_id)
@@ -977,6 +1027,8 @@ def create_app(
         document = _record_or_404(store, "document", document_id)
         document["status"] = "uploaded"
         document["progress"] = {"stage": "queued", "percent": 0}
+        document["processed"] = None
+        document["downstream_ids"].pop("document_job_id", None)
         store.put("document", document_id, document)
         background_tasks.add_task(workflows.run_document, document_id)
         return {"id": document_id, "status": "uploaded", "attempt": len(document["extraction_attempts"]) + 1}

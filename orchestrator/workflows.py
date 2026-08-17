@@ -631,12 +631,23 @@ class WorkflowService:
                 ),
                 None,
             )
-            review_flags = []
+            field_confidence = float((semantic_field or {}).get("confidence", layout_region.get("confidence", 0)))
+            review_reasons = []
             if semantic_field is None:
-                review_flags.append("VLM did not assign this layout region; human confirmation is required")
+                review_reasons.append("No semantic field mapping was found")
             if extraction_mode is None:
-                review_flags.append(f"Unsupported or ambiguous field type: {field_type or layout_region['region_type']}")
-            review_flags.extend(str(item) for item in (semantic_field or {}).get("review_notes", []))
+                review_reasons.append(f"Unsupported or ambiguous field type: {field_type or layout_region['region_type']}")
+            if field_confidence < 0.8:
+                review_reasons.append("Low AI confidence")
+            if (semantic_field or {}).get("review_required"):
+                review_reasons.extend(
+                    str(item)
+                    for item in (semantic_field or {}).get("review_reasons", [])
+                    if isinstance(item, str) and item.strip()
+                )
+                if not (semantic_field or {}).get("review_reasons"):
+                    review_reasons.append("Model requested human review")
+            review_required = bool(review_reasons)
             semantic_key = (semantic_field or {}).get("key") or f"field_{index:03d}"
             option_key = (semantic_option or {}).get("option_key")
             key = f"{semantic_key}_{option_key}" if option_key else semantic_key
@@ -657,7 +668,7 @@ class WorkflowService:
                     "language": label.get("primary_language") or "unknown",
                     "extraction_mode": extraction_mode,
                     "required": bool((semantic_field or {}).get("required", False)),
-                    "confidence": float((semantic_field or {}).get("confidence", layout_region.get("confidence", 0))),
+                    "confidence": field_confidence,
                     "bbox": xyxy_to_normalized_xywh(layout_region["bbox_px"], identity["width"], identity["height"]),
                     "source_region_ids": [layout_region["region_id"]],
                     "source_label_id": (semantic_field or {}).get("label_id"),
@@ -666,7 +677,9 @@ class WorkflowService:
                     "semantic_group_field_id": (semantic_field or {}).get("field_id") if semantic_option else None,
                     "option_key": option_key,
                     "parent_region_id": layout_region.get("parent_region_id"),
-                    "review_flags": review_flags,
+                    "review_required": review_required,
+                    "review_reasons": review_reasons,
+                    "model_metadata": (semantic_field or {}).get("model_metadata"),
                     "validation": (semantic_field or {}).get("validation"),
                     "enabled": True,
                     "geometry_source": "PP-DocLayoutV3",
@@ -895,16 +908,20 @@ class WorkflowService:
             json=definition,
         )
         registered_definition = response.json()
-        reference_path = self.settings.storage_root / registration_id / "page_001.png"
-        if not reference_path.is_file():
-            raise AdapterError("Approved template is missing its canonical reference page")
-        await self.client.request(
-            "document-processing-layer",
-            "POST",
-            f"{self.settings.document_processing_url}/api/v1/templates/{pinned_id}/reference",
-            correlation_id=correlation_id,
-            files={"file": ("page_001.png", reference_path.read_bytes(), "image/png")},
-        )
+        reference_paths: list[Path] = []
+        for page_number in range(1, len(identities) + 1):
+            reference_path = self.settings.storage_root / registration_id / f"page_{page_number:03d}.png"
+            if not reference_path.is_file():
+                raise AdapterError(f"Approved template is missing canonical reference page {page_number}")
+            await self.client.request(
+                "document-processing-layer",
+                "POST",
+                f"{self.settings.document_processing_url}/api/v1/templates/{pinned_id}/reference",
+                correlation_id=correlation_id,
+                params={"page_number": page_number},
+                files={"file": (reference_path.name, reference_path.read_bytes(), "image/png")},
+            )
+            reference_paths.append(reference_path)
         now = iso_now()
         version_id = f"{template_id}:v{revision}"
         version = {
@@ -913,7 +930,8 @@ class WorkflowService:
             "version": str(revision),
             "definition": registered_definition,
             "draft_snapshot": record["draft"],
-            "reference_image_path": str(reference_path),
+            "reference_image_path": str(reference_paths[0]),
+            "reference_image_paths": [str(path) for path in reference_paths],
             "approved_at": now,
             "approved_by": actor,
             "immutable": True,
@@ -974,17 +992,37 @@ class WorkflowService:
                 correlation_id=correlation_id,
                 json=definition,
             )
-            reference_image_path = template_version.get("reference_image_path")
-            if not isinstance(reference_image_path, str) or not Path(reference_image_path).is_file():
-                raise AdapterError("approved template version is missing its canonical reference image")
-            reference_path = Path(reference_image_path)
-            await self.client.request(
-                "document-processing-layer",
-                "POST",
-                f"{self.settings.document_processing_url}/api/v1/templates/{template['downstream_template_id']}/reference",
-                correlation_id=correlation_id,
-                files={"file": ("page_001.png", reference_path.read_bytes(), "image/png")},
-            )
+            reference_image_paths = template_version.get("reference_image_paths") or [
+                template_version.get("reference_image_path")
+            ]
+            expected_pages = int(template.get("pages") or 1)
+            if len(reference_image_paths) < expected_pages:
+                # Versions approved before multi-page references were introduced
+                # still point at page_001. Reconstruct the sibling canonical paths
+                # when the immutable registration artifacts are still present.
+                first_reference = reference_image_paths[0] if reference_image_paths else None
+                if isinstance(first_reference, str):
+                    first_path = Path(first_reference)
+                    recovered_paths = [
+                        str(first_path.parent / f"page_{page_number:03d}.png")
+                        for page_number in range(1, expected_pages + 1)
+                    ]
+                    if all(Path(path).is_file() for path in recovered_paths):
+                        reference_image_paths = recovered_paths
+                if len(reference_image_paths) < expected_pages:
+                    raise AdapterError("approved template version is missing canonical reference pages")
+            for page_number, reference_image_path in enumerate(reference_image_paths[:expected_pages], 1):
+                if not isinstance(reference_image_path, str) or not Path(reference_image_path).is_file():
+                    raise AdapterError(f"approved template version is missing canonical reference page {page_number}")
+                reference_path = Path(reference_image_path)
+                await self.client.request(
+                    "document-processing-layer",
+                    "POST",
+                    f"{self.settings.document_processing_url}/api/v1/templates/{template['downstream_template_id']}/reference",
+                    correlation_id=correlation_id,
+                    params={"page_number": page_number},
+                    files={"file": (reference_path.name, reference_path.read_bytes(), "image/png")},
+                )
             record["status"] = "processing"
             record["progress"] = {"stage": "document_processing", "percent": 35}
             record["updated_at"] = iso_now()
@@ -1000,11 +1038,19 @@ class WorkflowService:
             )
             upstream = response.json()
             record["downstream_ids"]["document_job_id"] = upstream["job_id"]
+            record["pages"] = int(upstream.get("page_count") or record.get("pages") or 1)
             record["processed"] = self._adapt_document_result(upstream)
             record["extraction_attempts"].append(
                 {"attempt": len(record["extraction_attempts"]) + 1, "created_at": iso_now(), "upstream": upstream}
             )
-            record["status"] = "needs_review" if upstream.get("needs_human_review", False) else "ready_to_sync"
+            if upstream.get("status") == "FAILED":
+                record["status"] = "needs_review"
+                record["failure"] = {
+                    "code": "DOCUMENT_ALIGNMENT_FAILED",
+                    "message": upstream.get("error") or "Document alignment failed.",
+                }
+            else:
+                record["status"] = "needs_review" if upstream.get("needs_human_review", False) else "ready_to_sync"
             record["review_status"] = "pending"
             record["progress"] = {"stage": "human_review", "percent": 100}
             record["export_urls"] = {
@@ -1060,6 +1106,7 @@ class WorkflowService:
                 "warnings": warnings,
                 "input_field": key,
                 "label": item.get("label", key.replace("_", " ").title()),
+                "page": int(item.get("page") or 1),
             }
             if item.get("human_review_flag", False):
                 review_fields.append(key)
@@ -1070,6 +1117,9 @@ class WorkflowService:
                 "overall_confidence": upstream.get("overall_confidence", 0),
                 "review_fields": review_fields,
                 "needs_human_review": upstream.get("needs_human_review", False),
+                "page_count": int(upstream.get("page_count") or 1),
+                "page_alignment_scores": upstream.get("page_alignment_scores") or {},
+                "aligned_page_count": len(upstream.get("aligned_page_paths") or {}),
             },
             "original_upstream_result": upstream,
         }
