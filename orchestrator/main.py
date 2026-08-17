@@ -888,19 +888,16 @@ def create_app(
         return await approve_registration_common(registration_id, request)
 
     def create_document_record(
-        *, content: bytes, filename: str, template_id: str | None, correlation_id: str
+        *, content: bytes, filename: str, template_id: str | None, correlation_id: str,
+        template_match: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        templates = [item for item in store.list("template") if item.get("status") == "active" and not item.get("deleted_at")]
-        if template_id is None:
-            if len(templates) != 1:
-                raise HTTPException(status_code=409, detail="template match is ambiguous; select an approved template")
-            template = templates[0]
-            template_id = template["id"]
-            confirmed = False
-        else:
+        if template_id is not None:
             template = _record_or_404(store, "template", template_id)
             confirmed = True
-        if template.get("status") != "active":
+        else:
+            template = None
+            confirmed = False
+        if template is not None and template.get("status") != "active":
             raise HTTPException(status_code=409, detail="template is not approved")
         document_id = _id("DOC")
         path = workflows.save_upload(document_id, filename, content)
@@ -909,16 +906,16 @@ def create_app(
             "id": document_id,
             "file_name": filename,
             "template_id": template_id,
-            "template_version": template["version_id"],
-            "form_type_id": template["form_type_id"],
+            "template_version": template["version_id"] if template else None,
+            "form_type_id": template["form_type_id"] if template else "",
             "source_path": str(path),
-            "status": "uploaded",
+            "status": "uploaded" if template else "needs_review",
             "sync_status": "not_synced",
             "review_status": "pending",
             "processed": None,
-            "pages": int(template.get("pages") or 1),
-            "progress": {"stage": "queued", "percent": 0},
-            "template_match": {"template_id": template_id, "version": template["version"], "score": 1.0 if confirmed else 0.5, "confirmed": confirmed},
+            "pages": int(template.get("pages") or 1) if template else 1,
+            "progress": {"stage": "queued", "percent": 0} if template else {"stage": "template_match", "percent": 100},
+            "template_match": template_match or ({"template_id": template_id, "version": template["version"], "score": 1.0 if confirmed else 0.5, "confirmed": confirmed} if template else {"template_id": None, "score": 0, "confirmed": False}),
             "extraction_attempts": [],
             "human_corrections": [],
             "downstream_ids": {},
@@ -930,9 +927,50 @@ def create_app(
         store.put("document", document_id, record, create_only=True)
         store.add_audit(
             action="uploaded completed form", target_type="document", target_id=document_id,
-            correlation_id=correlation_id, template_version=template["version_id"], after={"file_name": filename},
+            correlation_id=correlation_id, template_version=template["version_id"] if template else None, after={"file_name": filename},
         )
         return record
+
+    async def auto_match_document(
+        *, content: bytes, filename: str, correlation_id: str
+    ) -> tuple[str | None, dict[str, Any]]:
+        result = await workflows.match_document_template(
+            content=content, filename=filename, correlation_id=correlation_id,
+        )
+        downstream_template_id = result.get("selected_template_id")
+        template = next(
+            (
+                item for item in store.list("template")
+                if item.get("downstream_template_id") == downstream_template_id
+                and item.get("status") == "active" and not item.get("deleted_at")
+            ),
+            None,
+        )
+        candidates = [
+            {
+                **candidate,
+                "template_id": next(
+                    (
+                        item["id"] for item in store.list("template")
+                        if item.get("downstream_template_id") == candidate.get("template_id")
+                    ),
+                    candidate.get("template_id"),
+                ),
+            }
+            for candidate in result.get("candidates", [])
+        ]
+        score = float(result.get("score") or 0)
+        if template:
+            return template["id"], {
+                "template_id": template["id"], "version": template["version"],
+                "score": score, "confirmed": True, "reason": "Automatically matched approved template",
+                "candidates": candidates,
+            }
+        return None, {
+            "template_id": None, "score": score, "confirmed": False,
+            "reason": result.get("reason") or "Template match is uncertain; select a template to continue.",
+            "candidates": candidates,
+        }
 
     @app.post("/api/v1/document-jobs", status_code=202, tags=["documents"])
     async def create_document_jobs(
@@ -944,11 +982,19 @@ def create_app(
         items = []
         for upload in files:
             content = await _read_upload(upload, configured)
+            matched_template_id = template_id
+            match_details = None
+            if matched_template_id is None:
+                matched_template_id, match_details = await auto_match_document(
+                    content=content, filename=upload.filename or "document",
+                    correlation_id=request.state.correlation_id,
+                )
             item = create_document_record(
-                content=content, filename=upload.filename or "document", template_id=template_id,
-                correlation_id=request.state.correlation_id,
+                content=content, filename=upload.filename or "document", template_id=matched_template_id,
+                correlation_id=request.state.correlation_id, template_match=match_details,
             )
-            background_tasks.add_task(workflows.run_document, item["id"])
+            if matched_template_id:
+                background_tasks.add_task(workflows.run_document, item["id"])
             items.append({"id": item["id"], "job_id": item["id"], "status": item["status"]})
         return {"items": items}
 
@@ -1012,6 +1058,8 @@ def create_app(
         before = document.get("template_match")
         document["template_id"] = template["id"]
         document["template_version"] = template["version_id"]
+        document["form_type_id"] = template["form_type_id"]
+        document["pages"] = int(template.get("pages") or 1)
         document["template_match"] = {"template_id": template["id"], "version": template["version"], "score": 1.0, "confirmed": True, "reason": payload.get("reason")}
         document["updated_at"] = iso_now()
         store.put("document", document_id, document)
@@ -1028,6 +1076,7 @@ def create_app(
         document["status"] = "uploaded"
         document["progress"] = {"stage": "queued", "percent": 0}
         document["processed"] = None
+        document.pop("failure", None)
         document["downstream_ids"].pop("document_job_id", None)
         store.put("document", document_id, document)
         background_tasks.add_task(workflows.run_document, document_id)
@@ -1150,18 +1199,25 @@ def create_app(
     async def compatibility_upload_documents(
         request: Request,
         background_tasks: BackgroundTasks,
-        template_id: str = Query(...),
+        template_id: str | None = Query(None),
         process_immediately: bool = Query(True),
         files: list[UploadFile] = File(...),
     ) -> dict[str, Any]:
         items = []
         for upload in files:
             content = await _read_upload(upload, configured)
+            matched_template_id = template_id
+            match_details = None
+            if matched_template_id is None:
+                matched_template_id, match_details = await auto_match_document(
+                    content=content, filename=upload.filename or "document",
+                    correlation_id=request.state.correlation_id,
+                )
             item = create_document_record(
-                content=content, filename=upload.filename or "document", template_id=template_id,
-                correlation_id=request.state.correlation_id,
+                content=content, filename=upload.filename or "document", template_id=matched_template_id,
+                correlation_id=request.state.correlation_id, template_match=match_details,
             )
-            if process_immediately:
+            if process_immediately and matched_template_id:
                 background_tasks.add_task(workflows.run_document, item["id"])
             items.append(item)
         return {"items": items}
