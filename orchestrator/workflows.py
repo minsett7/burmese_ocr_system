@@ -971,6 +971,52 @@ class WorkflowService:
         )
         return {"registration": record, "template": template}
 
+    async def match_document_template(
+        self, *, content: bytes, filename: str, correlation_id: str
+    ) -> dict[str, Any]:
+        """Register approved references downstream and return an evidence-based match."""
+        templates = [
+            item for item in self.store.list("template")
+            if item.get("status") == "active" and not item.get("deleted_at")
+        ]
+        for template in templates:
+            version = self.store.require("template_version", template["version_id"])
+            definition = version.get("definition")
+            if not isinstance(definition, dict):
+                continue
+            await self.client.request(
+                "document-processing-layer", "POST",
+                f"{self.settings.document_processing_url}/api/v1/templates/register",
+                correlation_id=correlation_id, json=definition,
+            )
+            reference_paths = version.get("reference_image_paths") or [version.get("reference_image_path")]
+            expected_pages = int(template.get("pages") or 1)
+            if len(reference_paths) < expected_pages and isinstance(reference_paths[0] if reference_paths else None, str):
+                first_path = Path(reference_paths[0])
+                recovered_paths = [
+                    str(first_path.parent / f"page_{page_number:03d}.png")
+                    for page_number in range(1, expected_pages + 1)
+                ]
+                if all(Path(path).is_file() for path in recovered_paths):
+                    reference_paths = recovered_paths
+            for page_number, reference_path_value in enumerate(reference_paths[:expected_pages], 1):
+                if not isinstance(reference_path_value, str) or not Path(reference_path_value).is_file():
+                    continue
+                reference_path = Path(reference_path_value)
+                await self.client.request(
+                    "document-processing-layer", "POST",
+                    f"{self.settings.document_processing_url}/api/v1/templates/{template['downstream_template_id']}/reference",
+                    correlation_id=correlation_id, params={"page_number": page_number},
+                    files={"file": (reference_path.name, reference_path.read_bytes(), "image/png")},
+                )
+        response = await self.client.request(
+            "document-processing-layer", "POST",
+            f"{self.settings.document_processing_url}/api/v1/documents/match-template",
+            correlation_id=correlation_id,
+            files={"file": (filename, content, mimetypes.guess_type(filename)[0] or "application/octet-stream")},
+        )
+        return response.json()
+
     async def run_document(self, document_id: str) -> None:
         record = self.store.require("document", document_id)
         correlation_id = record["correlation_id"]
@@ -1051,6 +1097,10 @@ class WorkflowService:
                 }
             else:
                 record["status"] = "needs_review" if upstream.get("needs_human_review", False) else "ready_to_sync"
+                # A retry can recover from an earlier alignment failure.  Do
+                # not leave that historical failure on a successful partial
+                # or complete extraction result.
+                record.pop("failure", None)
             record["review_status"] = "pending"
             record["progress"] = {"stage": "human_review", "percent": 100}
             record["export_urls"] = {
