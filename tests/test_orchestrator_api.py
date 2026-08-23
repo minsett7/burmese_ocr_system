@@ -429,6 +429,79 @@ def test_stale_draft_revision_returns_409(client):
     assert stale.status_code == 409
 
 
+def test_failed_template_registration_can_be_retried(client):
+    test_client, fake = client
+    fake.fail_layout = True
+    response = test_client.post(
+        "/api/v1/template-registrations",
+        data={"name": "Retryable form", "form_type_id": "motor"},
+        files={"file": ("blank.png", fake.page, "image/png")},
+    )
+    registration_id = response.json()["id"]
+    assert test_client.get(f"/api/v1/template-registrations/{registration_id}").json()["status"] == "failed"
+
+    fake.fail_layout = False
+    retry = test_client.post(f"/api/v1/template-registrations/{registration_id}/retry")
+    assert retry.status_code == 202, retry.text
+    retried = test_client.get(f"/api/v1/template-registrations/{registration_id}").json()
+    assert retried["status"] == "needs_approval"
+    assert retried["failure"] is None
+
+
+def test_manual_region_can_be_saved_without_replacing_detector_regions(client):
+    test_client, fake = client
+    response = test_client.post(
+        "/api/v1/template-registrations",
+        data={"name": "Manual field form", "form_type_id": "motor"},
+        files={"file": ("blank.png", fake.page, "image/png")},
+    )
+    registration_id = response.json()["id"]
+    registration = test_client.get(f"/api/v1/template-registrations/{registration_id}").json()
+    draft = registration["draft"]
+    regions = [*draft["regions"], {
+        "id": "manual_extra_reference",
+        "field_id": "manual_extra_reference",
+        "page": 1,
+        "key": "extra_reference",
+        "label": "Extra reference",
+        "data_type": "text",
+        "language": "en",
+        "extraction_mode": "printed_text",
+        "required": False,
+        "confidence": 1,
+        "bbox": {"x": 0.1, "y": 0.1, "width": 0.2, "height": 0.04},
+        "source_region_ids": [],
+        "enabled": True,
+        "review_required": False,
+        "review_reasons": [],
+    }]
+
+    saved = test_client.put(
+        f"/api/v1/template-registrations/{registration_id}/draft",
+        json={"revision": registration["draft_revision"], "regions": regions},
+    )
+    assert saved.status_code == 200, saved.text
+    saved_regions = saved.json()["draft"]["regions"]
+    assert len(saved_regions) == len(regions)
+    manual = next(item for item in saved_regions if item["id"] == "manual_extra_reference")
+    assert manual["geometry_source"] == "manual"
+
+
+def test_approved_template_can_open_and_publish_a_new_revision(client):
+    test_client, _ = client
+    registration_id, template = register_and_approve(test_client)
+
+    revision = test_client.post(f"/api/v1/template-registrations/{registration_id}/revisions")
+    assert revision.status_code == 201, revision.text
+    assert revision.json()["status"] == "needs_approval"
+    assert revision.json()["draft_revision"] == 2
+
+    approved = test_client.post(f"/api/v1/template-registrations/{registration_id}/approve")
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["template"]["id"] == template["id"]
+    assert approved.json()["template"]["version"] == "2"
+
+
 def test_document_workflow_review_approval_and_real_exports(client):
     test_client, fake = client
     _, template = register_and_approve(test_client)
