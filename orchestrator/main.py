@@ -349,6 +349,65 @@ def create_app(
     async def get_registration(registration_id: str) -> dict[str, Any]:
         return _record_or_404(store, "registration", registration_id)
 
+    @app.post("/api/v1/template-registrations/{registration_id}/retry", status_code=202, tags=["templates"])
+    async def retry_registration(
+        registration_id: str,
+        request: Request,
+        background_tasks: BackgroundTasks,
+    ) -> dict[str, Any]:
+        """Restart a failed registration using its original uploaded form."""
+        record = _record_or_404(store, "registration", registration_id)
+        if record.get("status") != "failed":
+            raise HTTPException(status_code=409, detail="only failed template registrations can be retried")
+        if not Path(str(record.get("source_path") or "")).is_file():
+            raise HTTPException(status_code=409, detail="the original upload is no longer available; upload the form again")
+        record.update({
+            "status": "validating",
+            "progress": {
+                "stage": "upload_validation",
+                "percent": 5,
+                "message": "Retry queued; validating the original template upload.",
+            },
+            "layout_status": "pending",
+            "ocr_status": "pending",
+            "failure": None,
+            "draft": None,
+            "draft_revision": 0,
+            "downstream_ids": {},
+            "updated_at": iso_now(),
+        })
+        store.put("registration", registration_id, record)
+        store.add_audit(
+            action="retried template registration", target_type="template_registration", target_id=registration_id,
+            actor=request.headers.get("X-Actor", "reviewer"), correlation_id=request.state.correlation_id,
+        )
+        background_tasks.add_task(workflows.run_template_registration, registration_id)
+        return {"id": registration_id, "job_id": registration_id, "status": record["status"], "progress": record["progress"]}
+
+    @app.post("/api/v1/template-registrations/{registration_id}/revisions", status_code=201, tags=["templates"])
+    async def create_registration_revision(registration_id: str, request: Request) -> dict[str, Any]:
+        """Re-open the approved definition as the next editable, versioned draft."""
+        record = _record_or_404(store, "registration", registration_id)
+        if record.get("status") != "registered" or not record.get("template_id") or not record.get("draft"):
+            raise HTTPException(status_code=409, detail="only an approved template with a saved definition can be revised")
+        record["status"] = "needs_approval"
+        record["approved_at"] = None
+        record["progress"] = {
+            "stage": "human_review",
+            "percent": 100,
+            "message": f"Editing draft for version {int(record.get('approved_version_number', 0)) + 1}.",
+        }
+        record["draft_revision"] = int(record.get("draft_revision", 0)) + 1
+        record["draft"] = {**record["draft"], "revision": record["draft_revision"]}
+        record["updated_at"] = iso_now()
+        store.put("registration", registration_id, record)
+        store.add_audit(
+            action="created editable template revision", target_type="template_registration", target_id=registration_id,
+            actor=request.headers.get("X-Actor", "reviewer"), correlation_id=request.state.correlation_id,
+            after={"next_version": int(record.get("approved_version_number", 0)) + 1},
+        )
+        return record
+
     @app.patch("/api/v1/template-registrations/{registration_id}", tags=["templates"])
     @app.patch("/api/template-registrations/{registration_id}", tags=["compatibility"])
     async def update_registration_metadata(
@@ -460,17 +519,24 @@ def create_app(
         supplied_ids = [item.get("id") for item in regions if isinstance(item, dict)]
         if len(supplied_ids) != len(regions) or len(set(supplied_ids)) != len(supplied_ids):
             raise HTTPException(status_code=422, detail="draft region IDs must be present and unique")
-        if set(supplied_ids) != set(current_ids):
+        if not set(current_ids).issubset(supplied_ids):
             raise HTTPException(status_code=422, detail="draft must preserve the complete authoritative region set")
         previous_by_id = {item["id"]: item for item in current_draft["regions"]}
         saved_regions = []
         for region in regions:
-            previous = previous_by_id[region["id"]]
-            geometry_source = (
-                "human_corrected"
-                if region.get("bbox") != previous.get("bbox")
-                else previous.get("geometry_source", "PP-DocLayoutV3")
-            )
+            previous = previous_by_id.get(region["id"])
+            if previous is None:
+                if not str(region["id"]).startswith("manual_"):
+                    raise HTTPException(status_code=422, detail="new regions must use a manual_ ID")
+                if region.get("source_region_ids") not in (None, []):
+                    raise HTTPException(status_code=422, detail="manual regions cannot claim detector source regions")
+                geometry_source = "manual"
+            else:
+                geometry_source = (
+                    "human_corrected"
+                    if region.get("bbox") != previous.get("bbox")
+                    else previous.get("geometry_source", "PP-DocLayoutV3")
+                )
             saved_regions.append({**region, "geometry_source": geometry_source})
         new_revision = int(record["draft_revision"]) + 1
         record["draft"] = {
@@ -556,7 +622,7 @@ def create_app(
         draft_ids = [item.get("id") for item in regions if isinstance(item, dict)]
         if len(draft_ids) != len(regions) or len(set(draft_ids)) != len(draft_ids):
             errors.append("draft region IDs must be present and unique")
-        if set(draft_ids) != set(layout_regions):
+        if not set(layout_regions).issubset(draft_ids):
             errors.append("draft must preserve every authoritative non-cell layout region")
         keys: set[str] = set()
         field_ids: set[str] = set()
@@ -598,7 +664,11 @@ def create_app(
             if region.get("extraction_mode") not in valid_modes:
                 errors.append(f"{region_id}: unsupported or ambiguous field type must be resolved")
             source_ids = region.get("source_region_ids")
-            if (
+            is_manual = region.get("geometry_source") == "manual" or str(region_id).startswith("manual_")
+            if is_manual:
+                if source_ids not in (None, []):
+                    errors.append(f"{region_id}: manual fields cannot claim detector source regions")
+            elif (
                 not isinstance(source_ids, list)
                 or not source_ids
                 or any(item not in all_layout_regions for item in source_ids)
