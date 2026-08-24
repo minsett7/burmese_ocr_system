@@ -885,6 +885,11 @@ def semantic_draft_to_template(
                 "required": bool(region.get("required", False)),
                 "validation_regex": (region.get("validation") or {}).get("pattern") if isinstance(region.get("validation"), dict) else None,
             }
+        choice_mode = str(region.get("data_type") or "").lower()
+        if choice_mode in {"single_choice", "multiple_choice"}:
+            field["choice_group_id"] = _safe_id("choice_", region.get("semantic_group_field_id", field_id), index)
+            field["choice_option_value"] = str(region.get("option_key") or region.get("key") or field_id)
+            field["choice_mode"] = choice_mode
         if multi_page:
             field["page"] = page_number
         fields.append(field)
