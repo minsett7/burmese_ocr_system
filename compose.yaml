@@ -25,9 +25,18 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-insurance_platform}:${POSTGRES_PASSWORD:-change-me-local-only}@postgres:5432/${POSTGRES_DB:-insurance_platform}
       DEVICE: cpu
       BLUR_LAPLACIAN_THRESHOLD: ${BLUR_LAPLACIAN_THRESHOLD:-100}
-      CONFIDENCE_THRESHOLD: ${DOCUMENT_CONFIDENCE_THRESHOLD:-0.85}
+      CONFIDENCE_THRESHOLD: ${DOCUMENT_CONFIDENCE_THRESHOLD:-0.80}
+      LLM_POST_CORRECTION_ENABLED: ${LLM_POST_CORRECTION_ENABLED:-false}
+      LLM_POST_CORRECTION_URL: ${LLM_POST_CORRECTION_URL:-http://insurance-vlm:8000}
+      LLM_POST_CORRECTION_API_KEY: ${VLM_API_KEY:-local-vlm-key}
+      LLM_POST_CORRECTION_TIMEOUT_SECONDS: ${LLM_POST_CORRECTION_TIMEOUT_SECONDS:-180}
+      # Production templates are registered by the approval workflow, not seeded here.
+      SEED_DEFAULT_TEMPLATE: ${SEED_DEFAULT_TEMPLATE:-false}
     volumes:
       - generated_documents:/app/storage
+      - ./runtime/document-crops:/app/storage/crops
+      - ./runtime/document-preprocessed-crops:/app/storage/preprocessed_crops
+      - ./runtime/document-line-crops:/app/storage/line_crops
       - document_models:/app/models_weights
     ports:
       - "8001:8000"
@@ -99,6 +108,12 @@ services:
       dockerfile: docker/insurance-vlm.Dockerfile
     environment:
       VLM_ENGINE: ${VLM_ENGINE:-mock}
+      VLM_POST_CORRECTION_PROVIDER: ${VLM_POST_CORRECTION_PROVIDER:-disabled}
+      GOOGLE_CLOUD_PROJECT: ${GEMINI_GOOGLE_CLOUD_PROJECT:-}
+      GOOGLE_CLOUD_LOCATION: ${GEMINI_GOOGLE_CLOUD_LOCATION:-global}
+      GEMINI_POST_CORRECTION_MODEL: ${GEMINI_POST_CORRECTION_MODEL:-gemini-3.5-flash}
+      GOOGLE_APPLICATION_CREDENTIALS: /var/secrets/google/application_default_credentials.json
+      VLM_MODEL_ID: ${VLM_MODEL_ID:-Qwen/Qwen3-VL-2B-Instruct}
       VLM_LLAMA_URL: ${VLM_LLAMA_URL:-http://127.0.0.1:8081}
       VLM_LLAMA_MODEL: ${VLM_LLAMA_MODEL:-Qwen/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M}
       VLM_LLAMA_TIMEOUT_SECONDS: ${VLM_LLAMA_TIMEOUT_SECONDS:-900}
@@ -112,6 +127,7 @@ services:
       VLM_IMAGE_MAX_PIXELS: ${VLM_IMAGE_MAX_PIXELS:-131072}
     volumes:
       - vlm_jobs:/var/lib/insurance-vlm/jobs
+      - ${GOOGLE_APPLICATION_CREDENTIALS_HOST_PATH:-./.credentials/application_default_credentials.json}:/var/secrets/google/application_default_credentials.json:ro
     ports:
       - "8004:8000"
     healthcheck:
@@ -135,7 +151,7 @@ services:
       OCR_URL: ${OCR_URL:-http://ocr-fastapi-service:8000}
       INSURANCE_VLM_URL: ${INSURANCE_VLM_URL:-http://insurance-vlm:8000}
       VLM_API_KEY: ${VLM_API_KEY:-local-vlm-key}
-      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-90}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-300}
       RETRY_ATTEMPTS: ${RETRY_ATTEMPTS:-3}
       RETRY_BACKOFF_SECONDS: ${RETRY_BACKOFF_SECONDS:-0.25}
       VLM_POLL_INTERVAL_SECONDS: ${VLM_POLL_INTERVAL_SECONDS:-0.5}
@@ -207,7 +223,7 @@ services:
     profiles: [gpu]
     environment:
       VLM_ENGINE: qwen
-      VLM_MODEL_ID: ${VLM_MODEL_ID:-Qwen/Qwen3-VL-4B-Instruct}
+      VLM_MODEL_ID: ${VLM_MODEL_ID:-Qwen/Qwen3-VL-2B-Instruct}
       VLM_API_KEY: ${VLM_API_KEY:-local-vlm-key}
       VLM_JOBS_DIR: /var/lib/insurance-vlm/jobs
       VLM_WORKERS: "1"

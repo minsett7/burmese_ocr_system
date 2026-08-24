@@ -40,6 +40,7 @@ class FakeDownstreams:
         self.quality_pass = True
         self.preprocessing_decision = "canonicalize_only"
         self.preprocessing_operations = ["exif_orientation", "rgb_conversion"]
+        self.preprocessing_profile = "template"
         self.fail_layout = False
         self.fail_ocr = False
         self.ocr_identity_overrides: dict[str, object] = {}
@@ -54,6 +55,7 @@ class FakeDownstreams:
         if method == "POST" and path == "/v1/documents":
             return httpx.Response(201, json={"document_id": "visual-doc", "status": "uploaded"})
         if method == "POST" and path.endswith("/preprocess"):
+            self.preprocessing_profile = json.loads(request.content).get("capture_profile", "template")
             capture_ready = not self.retake_required and self.quality_pass
             decision = "reject_and_retake" if not capture_ready else self.preprocessing_decision
             reasons = (
@@ -70,7 +72,7 @@ class FakeDownstreams:
                     "summary": {
                         "page_count": 1,
                         "quality_pass": self.quality_pass,
-                        "capture_profile": "template",
+                        "capture_profile": self.preprocessing_profile,
                         "decision": decision,
                         "capture_ready": capture_ready,
                         "retake_required": not capture_ready,
@@ -89,7 +91,7 @@ class FakeDownstreams:
                 200,
                 json={
                     "document_id": "visual-doc",
-                    "capture_profile": "template",
+                    "capture_profile": self.preprocessing_profile,
                     "capture_ready": capture_ready,
                     "retake_required": self.retake_required,
                     "pages": [
@@ -118,7 +120,7 @@ class FakeDownstreams:
                 200,
                 json={
                     "schema_version": "1.3.0",
-                    "capture_profile": "template",
+                    "capture_profile": self.preprocessing_profile,
                     "decision": decision,
                     "capture_ready": capture_ready,
                     "retake_required": not capture_ready,

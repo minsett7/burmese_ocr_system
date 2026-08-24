@@ -37,7 +37,7 @@ class Settings:
             ocr_url=os.getenv("OCR_URL", "http://ocr-fastapi-service:8000").rstrip("/"),
             vlm_url=os.getenv("INSURANCE_VLM_URL", "http://insurance-vlm:8000").rstrip("/"),
             vlm_api_key=os.getenv("VLM_API_KEY") or None,
-            request_timeout_seconds=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "60")),
+            request_timeout_seconds=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "300")),
             retry_attempts=int(os.getenv("RETRY_ATTEMPTS", "3")),
             retry_backoff_seconds=float(os.getenv("RETRY_BACKOFF_SECONDS", "0.25")),
             poll_interval_seconds=float(os.getenv("VLM_POLL_INTERVAL_SECONDS", "0.25")),

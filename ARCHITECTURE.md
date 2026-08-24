@@ -260,7 +260,7 @@ These constraints are verified from the pinned code and influence the umbrella d
 2. Insurance-VLM v1 accepts one page per registration. The orchestrator creates sequential page-scoped VLM jobs and merges their results into one draft; it never silently selects only the first page.
 3. Insurance-VLM mock mode validates contracts but does not create semantic fields; reviewers must map fields before approval.
 4. OCR returns a paged Pydantic response. The adapter validates each page against its canonical visual identity before building a VLM contract.
-5. Document processing synchronously returns a job record, renders uploaded PDFs with `pdftoppm`, applies each field to its declared page, uses in-memory registries, and generates exports on its persistent storage mount.
+5. Completed documents are first canonicalized by visual-field detection (paper boundary crop and perspective correction where appropriate). Template matching and OCR then use those canonical pages, with only a dimension-normalizing resize rather than a second feature-based template warp. The document-processing service returns a job record, applies each field to its declared page, uses in-memory registries, and generates exports on its persistent storage mount.
 6. The React frontend's compatibility client is maintained inside its submodule, while all production compatibility endpoints and records are served by the umbrella orchestrator.
 
 ## Deployment profiles

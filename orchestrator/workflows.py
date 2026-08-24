@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import mimetypes
 import uuid
 from pathlib import Path
 from typing import Any
+
+from PIL import Image
 
 from adapters.contracts import (
     AdapterError,
@@ -1017,10 +1020,215 @@ class WorkflowService:
         )
         return response.json()
 
+    async def _preprocess_completed_document(
+        self, record: dict[str, Any], correlation_id: str
+    ) -> list[tuple[bytes, ImageIdentity]] | None:
+        """Create paper-cropped canonical pages for a completed form.
+
+        This deliberately uses the same visual preprocessing contract as template
+        registration.  OCR receives these pages directly, so it does not need to
+        feature-warp the user's photo to the template a second time.
+        """
+        source_path = Path(record["source_path"])
+        response = await self.client.request(
+            "visual-field-detection",
+            "POST",
+            f"{self.settings.visual_field_url}/v1/documents",
+            correlation_id=correlation_id,
+            files={
+                "file": (
+                    record["file_name"],
+                    source_path.read_bytes(),
+                    mimetypes.guess_type(record["file_name"])[0] or "application/octet-stream",
+                )
+            },
+        )
+        visual_id = response.json()["document_id"]
+        record["downstream_ids"]["visual_document_id"] = visual_id
+
+        response = await self.client.request(
+            "visual-field-detection",
+            "POST",
+            f"{self.settings.visual_field_url}/v1/documents/{visual_id}/preprocess",
+            correlation_id=correlation_id,
+            json={
+                "correction_mode": "auto",
+                "capture_profile": "document",
+                "deskew": True,
+                "normalize_illumination": True,
+                "sharpen": True,
+            },
+        )
+        preprocess_result = response.json()
+        artifact_path = str(preprocess_result.get("artifact") or "")
+        if not artifact_path or artifact_path.startswith("/") or ".." in Path(artifact_path).parts:
+            raise AdapterError("Visual-field preprocessing did not return a valid manifest artifact")
+        manifest = (
+            await self.client.request(
+                "visual-field-detection",
+                "GET",
+                f"{self.settings.visual_field_url}/v1/documents/{visual_id}/artifacts/{artifact_path}",
+                correlation_id=correlation_id,
+            )
+        ).json()
+        preprocessing = self._build_preprocessing_result("auto", "auto", manifest)
+        if preprocessing["capture_profile"] != "document":
+            raise AdapterError("Visual-field preprocessing returned the wrong capture profile")
+        record["preprocessing"] = preprocessing
+
+        if preprocessing["retake_required"]:
+            record["status"] = "needs_review"
+            record["progress"] = {
+                "stage": "capture_quality",
+                "percent": 100,
+                "message": "The uploaded photo could not be safely paper-cropped. Please retake it.",
+            }
+            record["updated_at"] = iso_now()
+            self.store.put("document", record["id"], record)
+            self.store.add_audit(
+                action="document requires recapture",
+                target_type="document",
+                target_id=record["id"],
+                correlation_id=correlation_id,
+                after={"reasons": preprocessing["reasons"]},
+            )
+            return None
+
+        pages = manifest.get("pages") or []
+        if len(pages) != preprocessing["page_count"]:
+            raise AdapterError("Preprocessing manifest page count is inconsistent")
+        canonical_pages: list[tuple[bytes, ImageIdentity]] = []
+        identity_records: list[dict[str, Any]] = []
+        for expected_number, manifest_page in enumerate(pages, 1):
+            image_path = str(manifest_page.get("image_path") or "")
+            if not image_path or image_path.startswith("/") or ".." in Path(image_path).parts:
+                raise AdapterError("Preprocessing manifest did not identify a valid canonical page artifact")
+            page_bytes = (
+                await self.client.request(
+                    "visual-field-detection",
+                    "GET",
+                    f"{self.settings.visual_field_url}/v1/documents/{visual_id}/artifacts/{image_path}",
+                    correlation_id=correlation_id,
+                )
+            ).content
+            page_id = str(manifest_page.get("page_id") or "")
+            page_number = manifest_page.get("page_number")
+            if not page_bytes or page_id != f"page_{expected_number:03d}" or page_number != expected_number:
+                raise AdapterError("Preprocessing manifest has invalid canonical page identities")
+            identity = ImageIdentity.from_bytes(
+                page_bytes, document_id=visual_id, page_id=page_id, page_number=page_number
+            )
+            if manifest_page.get("sha256") != identity.sha256:
+                raise AdapterError("Canonical document page SHA-256 does not match the preprocessing manifest")
+            if manifest_page.get("width") != identity.width or manifest_page.get("height") != identity.height:
+                raise AdapterError("Canonical document page dimensions do not match the preprocessing manifest")
+            canonical_path = self.settings.storage_root / record["id"] / f"canonical_page_{page_number:03d}.png"
+            canonical_path.write_bytes(page_bytes)
+            canonical_pages.append((page_bytes, identity))
+            identity_records.append({
+                "sha256": identity.sha256,
+                "width": identity.width,
+                "height": identity.height,
+                "document_id": identity.document_id,
+                "page_id": identity.page_id,
+                "page_number": identity.page_number,
+                "path": str(canonical_path),
+            })
+        record["canonical_pages"] = identity_records
+        record["updated_at"] = iso_now()
+        self.store.put("document", record["id"], record)
+        return canonical_pages
+
+    @staticmethod
+    def _canonical_document_payload(
+        pages: list[tuple[bytes, ImageIdentity]]
+    ) -> tuple[bytes, str, str]:
+        """Return the canonical pages as the image/PDF shape expected by OCR."""
+        if len(pages) == 1:
+            return pages[0][0], "canonical-page-001.png", "image/png"
+        rendered_pages: list[Image.Image] = []
+        for page_bytes, _ in pages:
+            with Image.open(io.BytesIO(page_bytes)) as page:
+                rendered_pages.append(page.convert("RGB"))
+        output = io.BytesIO()
+        rendered_pages[0].save(
+            output, format="PDF", save_all=True, append_images=rendered_pages[1:], resolution=144.0
+        )
+        return output.getvalue(), "canonical-document.pdf", "application/pdf"
+
+    async def _match_canonical_document(
+        self, record: dict[str, Any], content: bytes, filename: str, correlation_id: str
+    ) -> bool:
+        result = await self.match_document_template(
+            content=content, filename=filename, correlation_id=correlation_id
+        )
+        downstream_template_id = result.get("selected_template_id")
+        template = next(
+            (
+                item for item in self.store.list("template")
+                if item.get("downstream_template_id") == downstream_template_id
+                and item.get("status") == "active" and not item.get("deleted_at")
+            ),
+            None,
+        )
+        candidates = [
+            {
+                **candidate,
+                "template_id": next(
+                    (
+                        item["id"] for item in self.store.list("template")
+                        if item.get("downstream_template_id") == candidate.get("template_id")
+                    ),
+                    candidate.get("template_id"),
+                ),
+            }
+            for candidate in result.get("candidates", [])
+        ]
+        if template is None:
+            record["template_match"] = {
+                "template_id": None,
+                "score": float(result.get("score") or 0),
+                "confirmed": False,
+                "reason": result.get("reason") or "Template match is uncertain; select a template to continue.",
+                "candidates": candidates,
+            }
+            record["status"] = "needs_review"
+            record["progress"] = {"stage": "template_match", "percent": 100}
+            record["updated_at"] = iso_now()
+            self.store.put("document", record["id"], record)
+            return False
+        record["template_id"] = template["id"]
+        record["template_version"] = template["version_id"]
+        record["form_type_id"] = template["form_type_id"]
+        record["pages"] = int(template.get("pages") or 1)
+        record["template_match"] = {
+            "template_id": template["id"],
+            "version": template["version"],
+            "score": float(result.get("score") or 0),
+            "confirmed": True,
+            "reason": "Automatically matched approved template",
+            "candidates": candidates,
+        }
+        record["updated_at"] = iso_now()
+        self.store.put("document", record["id"], record)
+        return True
+
     async def run_document(self, document_id: str) -> None:
         record = self.store.require("document", document_id)
         correlation_id = record["correlation_id"]
         try:
+            record["status"] = "processing"
+            record["progress"] = {"stage": "paper_detection", "percent": 15}
+            record["updated_at"] = iso_now()
+            self.store.put("document", document_id, record)
+            canonical_pages = await self._preprocess_completed_document(record, correlation_id)
+            if canonical_pages is None:
+                return
+            canonical_content, canonical_filename, canonical_media_type = self._canonical_document_payload(canonical_pages)
+            if not record.get("template_id") and not await self._match_canonical_document(
+                record, canonical_content, canonical_filename, correlation_id
+            ):
+                return
             template = self.store.require("template", record["template_id"])
             if template.get("status") != "active" or not template.get("version_id"):
                 raise ValueError("template has not been approved and registered")
@@ -1073,14 +1281,13 @@ class WorkflowService:
             record["progress"] = {"stage": "document_processing", "percent": 35}
             record["updated_at"] = iso_now()
             self.store.put("document", document_id, record)
-            source_path = Path(record["source_path"])
             response = await self.client.request(
                 "document-processing-layer",
                 "POST",
                 f"{self.settings.document_processing_url}/api/v1/documents/process",
                 correlation_id=correlation_id,
-                files={"file": (record["file_name"], source_path.read_bytes(), mimetypes.guess_type(record["file_name"])[0] or "application/octet-stream")},
-                data={"template_id": template["downstream_template_id"]},
+                files={"file": (canonical_filename, canonical_content, canonical_media_type)},
+                data={"template_id": template["downstream_template_id"], "canonicalized_pages": "true"},
             )
             upstream = response.json()
             record["downstream_ids"]["document_job_id"] = upstream["job_id"]
@@ -1147,6 +1354,9 @@ class WorkflowService:
                 "ocr_confidence": item.get("ocr_confidence", 0),
                 "source": "document-processing-layer",
                 "source_region": item.get("crop_image_path"),
+                "preprocessed_source_region": item.get("preprocessed_crop_path"),
+                "line_source_regions": item.get("line_crop_paths", []),
+                "ocr_mode": item.get("ocr_mode", "full_field_fallback"),
                 "field_type": item.get("field_type", "printed_text"),
                 "is_valid": bool(item.get("validation_passed", False)),
                 "validation_status": "valid" if item.get("validation_passed", False) else "invalid",
