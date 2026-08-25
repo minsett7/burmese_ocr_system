@@ -7,6 +7,31 @@ $ErrorActionPreference = "Stop"
 $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("insurance-smoke-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $tempDir | Out-Null
 
+# Windows PowerShell 5.1 does not provide Invoke-RestMethod -Form. Keep the
+# smoke test compatible with both Windows PowerShell and PowerShell 7.
+function Send-MultipartFile {
+    param([string]$Uri, [string]$Path)
+    Add-Type -AssemblyName System.Net.Http
+    $client = [System.Net.Http.HttpClient]::new()
+    $form = [System.Net.Http.MultipartFormDataContent]::new()
+    $stream = [System.IO.File]::OpenRead($Path)
+    $fileContent = [System.Net.Http.StreamContent]::new($stream)
+    $fileContent.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse("image/png")
+    $form.Add($fileContent, "files", [System.IO.Path]::GetFileName($Path))
+    try {
+        $response = $client.PostAsync($Uri, $form).GetAwaiter().GetResult()
+        $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if (-not $response.IsSuccessStatusCode) { throw "HTTP $([int]$response.StatusCode): $body" }
+        return $body | ConvertFrom-Json
+    }
+    finally {
+        $fileContent.Dispose()
+        $stream.Dispose()
+        $form.Dispose()
+        $client.Dispose()
+    }
+}
+
 try {
     $pngPath = Join-Path $tempDir "form.png"
     $png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z7N0AAAAASUVORK5CYII="
@@ -16,7 +41,7 @@ try {
     Invoke-RestMethod "$WebUrl/healthz" | Out-Null
     Invoke-RestMethod "$WebUrl/api/form-types" | Out-Null
 
-    $registrationResponse = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/template-registrations?form_type_id=motor" -Form @{ files = Get-Item $pngPath }
+    $registrationResponse = Send-MultipartFile -Uri "$BaseUrl/api/template-registrations?form_type_id=motor" -Path $pngPath
     $registrationId = $registrationResponse.items[0].id
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         $registration = Invoke-RestMethod "$BaseUrl/api/v1/template-registrations/$registrationId"
@@ -28,7 +53,7 @@ try {
 
     $approved = Invoke-RestMethod -Method Post "$BaseUrl/api/template-registrations/$registrationId/approve"
     $templateId = $approved.template.id
-    $documentResponse = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/documents?template_id=$templateId&process_immediately=true" -Form @{ files = Get-Item $pngPath }
+    $documentResponse = Send-MultipartFile -Uri "$BaseUrl/api/documents?template_id=$templateId&process_immediately=true" -Path $pngPath
     $documentId = $documentResponse.items[0].id
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         $document = Invoke-RestMethod "$BaseUrl/api/v1/documents/$documentId"

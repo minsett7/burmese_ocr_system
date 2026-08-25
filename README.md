@@ -38,6 +38,7 @@ services/                         Git submodules; independently versioned
   ocr-fastapi-service/
   insurance-vlm/
   insurance-claim-ui/
+burmese-ocr-system-UI/            Primary React/TypeScript frontend
 orchestrator/                     Thin FastAPI gateway and durable review API
 adapters/                         Explicit OCR/layout/VLM/template transformations
 docker/                           Orchestration-owned Dockerfiles and Nginx config
@@ -188,10 +189,10 @@ Run Vite at port 5173 while the unified backend is running:
 docker compose --profile frontend-dev up frontend-dev
 ```
 
-For direct development inside the submodule:
+For direct development of the primary frontend:
 
 ```bash
-cd services/insurance-claim-ui/frontend
+cd burmese-ocr-system-UI
 npm ci
 cp .env.example .env
 npm run dev -- --host 0.0.0.0
@@ -199,7 +200,7 @@ npm run dev -- --host 0.0.0.0
 
 Use `VITE_API_BASE_URL=http://localhost:8000`. The production Nginx image uses a same-origin base and proxies `/api` to `orchestrator:8000` with SPA fallback to `index.html`.
 
-The prototype FastAPI backend is intentionally absent from the default stack. It can be started only for independent legacy UI testing:
+The old `services/insurance-claim-ui` frontend is retained only as migration/API-contract history and is not built by the default or mock production-style stacks. Its prototype FastAPI backend can be started only for independent legacy testing:
 
 ```bash
 docker compose --profile frontend-standalone up frontend-prototype-backend
@@ -294,7 +295,7 @@ Canonical API flow:
 
 The orchestrator never auto-publishes a VLM result. Approval converts supported types to `printed_text`, `handwriting`, `checkbox`, `table`, or `signature`, rejects unresolved mappings, creates an immutable version record, and registers that exact definition with the document-processing service.
 
-The production frontend at `http://localhost:3000/#/templates` uses this canonical flow. It polls progress, shows retake instructions and failures, renders each canonical page with authoritative detector boxes, saves the complete draft with optimistic revisions, and calls server validation before approval. Page buttons switch the visible image and regions without dropping edits made on other pages. Detector regions can be disabled but cannot be deleted or duplicated. Model `review_flags` must be explicitly marked reviewed before approval.
+The production frontend at `http://localhost:3000` presents this canonical flow as **Upload → Analyze → Review → Save**. It polls progress, translates internal stages into user-facing messages, shows failures with optional developer details, renders each canonical page with authoritative detector boxes, and saves, validates, and approves through one final action. Page buttons switch the visible image and regions without dropping edits made on other pages. Detector regions are preserved in the authoritative draft and can be disabled; missing manual regions can be added. Model review requirements must be explicitly accepted before approval.
 
 Internally, registration uses each visual-field canonical page's exact bytes for OCR and the matching VLM job. The OCR and layout contracts share the same SHA-256, dimensions, document ID, page ID, and page number. Normalized OCR boxes become pixel `xyxy`; approved normalized `xywh` regions become page-specific document-processing pixel `xywh`.
 
@@ -331,9 +332,9 @@ Each workflow has a correlation ID, forwarded as `X-Correlation-ID` where suppor
 
 The current document-processing service keeps templates and jobs in memory. The orchestrator therefore re-registers the immutable approved template definition before every completed-document request, making processing safe after a downstream restart. The orchestrator's review records and audit events remain in PostgreSQL.
 
-## Frontend compatibility API
+## Frontend API boundary
 
-The unified orchestrator implements the prototype paths expected by `frontend/src/api.js`; they delegate to the same canonical records and workflows rather than running mock OCR:
+The primary TypeScript client in `burmese-ocr-system-UI/src/api/` uses canonical orchestrator actions for long-running and review workflows. The unified orchestrator also retains these compatibility paths for older clients; they delegate to the same canonical records and workflows rather than running mock OCR:
 
 - `GET /api/form-types`
 - `GET /api/templates` and `GET /api/templates/{id}`
@@ -355,7 +356,7 @@ The umbrella follows service code when repository documentation is stale:
 - Insurance-VLM v1 strict registration accepts exactly one image page plus OCR/layout JSON and always sets `review_required`; the orchestrator fans a multi-page form out into sequential page jobs and merges them. Mock mode intentionally emits no semantic fields.
 - Visual-field detection owns canonical page pixels and authoritative layout geometry. Table cells retain `parent_region_id` links to table regions.
 - Document processing is synchronous at `POST /api/v1/documents/process`, renders multi-page PDFs with `pdftoppm`, applies template fields by page, has an in-memory template/job registry, and writes exports to its storage volume. Its PostgreSQL scaffold is not part of the active pipeline.
-- The frontend repository's FastAPI service is a prototype with mock OCR. Production traffic goes through the umbrella orchestrator only.
+- The legacy frontend repository's FastAPI service is a prototype with mock OCR. Production traffic goes through the umbrella orchestrator only.
 
 ## Develop an individual service
 

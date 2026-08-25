@@ -1,8 +1,8 @@
 FROM node:20-alpine AS build
 WORKDIR /frontend
-COPY services/insurance-claim-ui/frontend/package.json services/insurance-claim-ui/frontend/package-lock.json ./
+COPY burmese-ocr-system-UI/package.json burmese-ocr-system-UI/package-lock.json ./
 RUN npm ci
-COPY services/insurance-claim-ui/frontend/ ./
+COPY burmese-ocr-system-UI/ ./
 ARG VITE_API_BASE_URL=.
 ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
 RUN npm run build

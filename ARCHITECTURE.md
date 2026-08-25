@@ -182,7 +182,7 @@ Use these files to follow the construction from input to approval:
 | OCR page numbering, exact image hashing, paged token response | [`services/ocr-fastapi-service/app/ocr_engine.py`](services/ocr-fastapi-service/app/ocr_engine.py) |
 | Runtime template page schema and bounds validation | [`services/document-processing-layer/app/models/schemas.py`](services/document-processing-layer/app/models/schemas.py) |
 | PDF rendering and page-aware runtime extraction | [`services/document-processing-layer/app/api/endpoints/documents.py`](services/document-processing-layer/app/api/endpoints/documents.py), [`pipeline_orchestrator.py`](services/document-processing-layer/app/services/pipeline_orchestrator.py) |
-| Frontend page selection, page-local rendering, and full-draft save | [`TemplateWorkspace.jsx`](services/insurance-claim-ui/frontend/src/TemplateWorkspace.jsx), [`templateEditorModel.js`](services/insurance-claim-ui/frontend/src/templateEditorModel.js) |
+| Frontend page selection, page-local rendering, and full-draft save | [`TemplateWorkspace.tsx`](burmese-ocr-system-UI/src/components/TemplateWorkspace.tsx), [`src/api`](burmese-ocr-system-UI/src/api) |
 
 ### Geometry conventions
 
@@ -261,7 +261,7 @@ These constraints are verified from the pinned code and influence the umbrella d
 3. Insurance-VLM mock mode validates contracts but does not create semantic fields; reviewers must map fields before approval.
 4. OCR returns a paged Pydantic response. The adapter validates each page against its canonical visual identity before building a VLM contract.
 5. Completed documents are first canonicalized by visual-field detection (paper boundary crop and perspective correction where appropriate). Template matching and OCR then use those canonical pages, with only a dimension-normalizing resize rather than a second feature-based template warp. The document-processing service returns a job record, applies each field to its declared page, uses in-memory registries, and generates exports on its persistent storage mount.
-6. The React frontend's compatibility client is maintained inside its submodule, while all production compatibility endpoints and records are served by the umbrella orchestrator.
+6. The primary React/TypeScript frontend is maintained in `burmese-ocr-system-UI`; its domain client talks only to the umbrella orchestrator. The legacy UI submodule is not part of the production build.
 
 ## Deployment profiles
 
