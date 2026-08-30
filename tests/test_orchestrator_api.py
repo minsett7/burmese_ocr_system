@@ -524,8 +524,26 @@ def test_document_workflow_review_approval_and_real_exports(client):
         json={"reviewer": "alice", "fields": [{"field_id": "field_policy", "corrected_value": "MTR124", "reason": "scan correction"}]},
     )
     assert review.status_code == 200
+    assert len(review.json()["human_corrections"]) == 1
+    repeated_review = test_client.put(
+        f"/api/v1/documents/{document_id}/review",
+        json={"reviewer": "alice", "fields": [{"field_id": "field_policy", "corrected_value": "MTR124"}]},
+    )
+    assert repeated_review.status_code == 200
+    assert len(repeated_review.json()["human_corrections"]) == 1
+    unknown_review = test_client.put(
+        f"/api/v1/documents/{document_id}/review",
+        json={"reviewer": "alice", "fields": [{"field_id": "synthetic_policy_number", "corrected_value": ""}]},
+    )
+    assert unknown_review.status_code == 422
     approved = test_client.post(f"/api/v1/documents/{document_id}/approve")
     assert approved.status_code == 200
+    assert approved.json()["review_status"] == "approved"
+    assert approved.json()["approved_at"]
+    synced = test_client.post(f"/api/v1/documents/{document_id}/sync")
+    assert synced.status_code == 200
+    assert synced.json()["status"] == "synced"
+    assert synced.json()["sync_status"] == "synced"
     export = test_client.get("/api/export/csv")
     assert export.status_code == 200
     assert "MTR124" in export.text

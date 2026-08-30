@@ -123,20 +123,17 @@ The service health endpoint can start without inference, but extraction needs th
 
 ### Document-processing TrOCR weights
 
-Optional fine-tuned printed-text weights belong at:
+Fine-tuned printed-text weights belong on the host at:
 
 ```text
-/app/models_weights/trocr-small-printed/
+./services/document-processing-layer/models_weights/trocr-small-printed/
 ```
 
-They are mounted through the `document_models` named volume. Seed an existing local model directory without putting it in Git:
+Compose mounts this directory read-only at `/app/models_weights`. If the weights live elsewhere,
+set the host path in `.env`:
 
-```bash
-docker volume create unified-insurance-platform_document_models
-docker run --rm \
-  -v unified-insurance-platform_document_models:/target \
-  -v "$PWD/models/document-processing:/source:ro" \
-  alpine:3.21 sh -c 'cp -a /source/. /target/'
+```env
+DOCUMENT_MODEL_SOURCE=/absolute/path/to/models_weights
 ```
 
 Without complete weights the current service deliberately uses its fallback extractor. That is useful for pipeline development, not an accuracy test.

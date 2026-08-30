@@ -21,6 +21,9 @@ services:
     build:
       context: services/document-processing-layer
       dockerfile: Dockerfile
+      args:
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-https://mirror.rackspace.com/debian}
+        DEBIAN_SECURITY_MIRROR: ${DEBIAN_SECURITY_MIRROR:-https://mirror.rackspace.com/debian-security}
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-insurance_platform}:${POSTGRES_PASSWORD:-change-me-local-only}@postgres:5432/${POSTGRES_DB:-insurance_platform}
       DEVICE: cpu
@@ -37,7 +40,7 @@ services:
       - ./runtime/document-crops:/app/storage/crops
       - ./runtime/document-preprocessed-crops:/app/storage/preprocessed_crops
       - ./runtime/document-line-crops:/app/storage/line_crops
-      - document_models:/app/models_weights
+      - ${DOCUMENT_MODEL_SOURCE:-./services/document-processing-layer/models_weights}:/app/models_weights:ro
     ports:
       - "8001:8000"
     depends_on:
@@ -56,6 +59,9 @@ services:
     build:
       context: services/visual-field-detection
       dockerfile: Dockerfile
+      args:
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-https://mirror.rackspace.com/debian}
+        DEBIAN_SECURITY_MIRROR: ${DEBIAN_SECURITY_MIRROR:-https://mirror.rackspace.com/debian-security}
     environment:
       DATA_ROOT: /data
       MODEL_DIR: /models/pp_doclayout_v3_epoch29_deployment_v1
@@ -86,6 +92,9 @@ services:
     build:
       context: services/ocr-fastapi-service
       dockerfile: Dockerfile
+      args:
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-https://mirror.rackspace.com/debian}
+        DEBIAN_SECURITY_MIRROR: ${DEBIAN_SECURITY_MIRROR:-https://mirror.rackspace.com/debian-security}
     environment:
       TESSERACT_CMD: /usr/bin/tesseract
       DEBUG_MODE: "false"
@@ -260,7 +269,6 @@ networks:
 volumes:
   postgres_data:
   generated_documents:
-  document_models:
   visual_field_data:
   layout_models:
   ocr_artifacts:

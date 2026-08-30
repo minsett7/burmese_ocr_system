@@ -1121,12 +1121,19 @@ def create_app(
             field_id = str(correction.get("field_id") or correction.get("key") or "")
             if not field_id:
                 raise HTTPException(status_code=422, detail="correction field_id is required")
-            field = processed_fields.setdefault(
-                field_id,
-                {"raw_value": "", "value": "", "normalized_value": "", "confidence": None, "source_region": None, "errors": [], "warnings": []},
-            )
+            field = processed_fields.get(field_id)
+            if field is None:
+                raise HTTPException(status_code=422, detail=f"unknown extracted field: {field_id}")
             original = field.get("value", field.get("raw_value", ""))
-            corrected = correction.get("corrected_value", correction.get("value", ""))
+            corrected = str(correction.get("corrected_value", correction.get("value", "")))
+            already_confirmed = (
+                field.get("source") == "human_correction"
+                and str(original) == corrected
+                and not field.get("requires_review")
+                and not field.get("errors")
+            )
+            if already_confirmed:
+                continue
             event = {
                 "id": _id("COR"),
                 "field_id": field_id,
@@ -1141,8 +1148,8 @@ def create_app(
                 "created_at": iso_now(),
             }
             immutable.append(event)
-            field["value"] = str(corrected)
-            field["normalized_value"] = str(corrected)
+            field["value"] = corrected
+            field["normalized_value"] = corrected
             field["source"] = "human_correction"
             field["review_status"] = "corrected"
             field["requires_review"] = False
