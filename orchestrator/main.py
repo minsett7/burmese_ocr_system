@@ -61,6 +61,107 @@ def _record_or_404(store: RecordStore, kind: str, record_id: str) -> dict[str, A
     return value
 
 
+def template_layout_regions(version: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return editable draft regions plus approved generated table-cell regions."""
+    draft = version.get("draft_snapshot") or {}
+    regions = [dict(item) for item in (draft.get("regions") or []) if isinstance(item, dict)]
+    existing_keys = {str(item.get("key")) for item in regions if item.get("key")}
+    pages = draft.get("pages") or ([draft["page"]] if isinstance(draft.get("page"), dict) else [])
+    dimensions = {
+        int(page["page_number"]): (int(page["width"]), int(page["height"]))
+        for page in pages
+        if isinstance(page, dict)
+        and page.get("page_number") is not None
+        and page.get("width")
+        and page.get("height")
+    }
+    definition = version.get("definition") or {}
+    for field in definition.get("fields") or []:
+        if not isinstance(field, dict) or not field.get("table_parent_field_id"):
+            continue
+        field_id = str(field.get("id") or "")
+        if not field_id or field_id in existing_keys:
+            continue
+        try:
+            page_number = int(field.get("page") or 1)
+            page_width, page_height = dimensions[page_number]
+            bbox = field["bbox"]
+            x = float(bbox["x"])
+            y = float(bbox["y"])
+            width = float(bbox["width"])
+            height = float(bbox["height"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if page_width < 1 or page_height < 1 or width <= 0 or height <= 0:
+            continue
+        regions.append({
+            "id": f"layout_{field_id}",
+            "region_type": "TABLE_CELL",
+            "field_id": field_id,
+            "page": page_number,
+            "key": field_id,
+            "label": str(field.get("label") or field_id),
+            "bbox": {
+                "x": x / page_width,
+                "y": y / page_height,
+                "width": width / page_width,
+                "height": height / page_height,
+            },
+            "enabled": True,
+            "table_parent_field_id": field.get("table_parent_field_id"),
+            "table_parent_label": field.get("table_parent_label"),
+            "table_row_index": field.get("table_row_index"),
+            "table_column_index": field.get("table_column_index"),
+            "table_cell_order": field.get("table_cell_order"),
+            "table_is_header": bool(field.get("table_is_header", False)),
+            "geometry_source": "approved_template_definition",
+        })
+        existing_keys.add(field_id)
+    return regions
+
+
+def template_field_key_map(version: dict[str, Any]) -> dict[str, str]:
+    """Map immutable processing field IDs to approved, business-facing keys."""
+    regions = template_layout_regions(version)
+    parent_keys: dict[str, str] = {}
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        field_id = str(region.get("field_id") or "")
+        key = str(region.get("key") or "")
+        if field_id and key and region.get("region_type") != "TABLE_CELL":
+            parent_keys[field_id] = key
+
+    mapping: dict[str, str] = {}
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        field_id = str(region.get("field_id") or "")
+        if not field_id:
+            continue
+        parent_id = str(region.get("table_parent_field_id") or "")
+        if parent_id:
+            parent_key = parent_keys.get(parent_id, parent_id.removeprefix("field_"))
+            row = int(region.get("table_row_index") or 0) + 1
+            column = int(region.get("table_column_index") or 0) + 1
+            mapping[field_id] = f"{parent_key}_r{row}_c{column}"
+            continue
+        key = str(region.get("key") or "")
+        if key:
+            mapping[field_id] = key
+    return mapping
+
+
+def exported_field_key(field_id: str, field: dict[str, Any], key_by_id: dict[str, str]) -> str:
+    parent_id = str(field.get("table_parent_field_id") or "")
+    if parent_id:
+        parent_key = key_by_id.get(parent_id, parent_id.removeprefix("field_"))
+        row = int(field.get("table_row_index") or 0) + 1
+        column = int(field.get("table_column_index") or 0) + 1
+        return f"{parent_key}_r{row}_c{column}"
+    return key_by_id.get(field_id, field_id.removeprefix("field_"))
+
+
 async def _read_upload(upload: UploadFile, settings: Settings) -> bytes:
     filename = upload.filename or ""
     suffix = Path(filename).suffix.lower()
@@ -823,7 +924,7 @@ def create_app(
             "template_id": template_id,
             "version": version["version"],
             "pages": draft.get("pages") or ([draft["page"]] if isinstance(draft.get("page"), dict) else []),
-            "regions": draft.get("regions") or [],
+            "regions": template_layout_regions(version),
         }
 
     @app.patch("/api/v1/templates/{template_id}", tags=["templates"])
@@ -1304,36 +1405,47 @@ def create_app(
     async def audit_events() -> list[dict[str, Any]]:
         return store.list("audit")
 
+    def document_is_export_ready(document: dict[str, Any]) -> bool:
+        return document.get("review_status") == "approved" or document.get("status") in {"ready_to_sync", "synced"}
+
+    def document_field_values(document: dict[str, Any]) -> dict[str, Any]:
+        fields = (document.get("processed") or {}).get("fields", {})
+        version_id = document.get("template_version")
+        version = store.get("template_version", version_id) if version_id else None
+        key_by_id = template_field_key_map(version or {})
+        values: dict[str, Any] = {}
+        for field_id, field in fields.items():
+            if not isinstance(field, dict):
+                continue
+            key = exported_field_key(str(field_id), field, key_by_id)
+            if key in values:
+                key = f"{key}__{field_id}"
+            values[key] = field.get("value")
+        return values
+
     def export_rows() -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for document in store.list("document"):
-            if document.get("deleted_at"):
+            if document.get("deleted_at") or not document_is_export_ready(document):
                 continue
-            fields = (document.get("processed") or {}).get("fields", {})
             row = {
-                "document_id": document["id"],
-                "file_name": document["file_name"],
-                "form_type": document["form_type_id"],
-                "status": document["status"],
-                "sync_status": document["sync_status"],
+                "_document_id": document["id"],
+                "_file_name": document["file_name"],
+                "_template_id": document.get("template_id"),
+                "_form_type": document.get("form_type_id"),
             }
-            row.update({key: value.get("value", "") for key, value in fields.items()})
+            row.update(document_field_values(document))
             rows.append(row)
         return rows
 
     @app.get("/api/export/json", tags=["compatibility"])
-    async def export_json() -> dict[str, Any]:
-        return {
-            "exported_at": iso_now(),
-            "templates": [item for item in store.list("template") if not item.get("deleted_at")],
-            "registrations": [item for item in store.list("registration") if not item.get("deleted_at")],
-            "documents": [item for item in store.list("document") if not item.get("deleted_at")],
-        }
+    async def export_json() -> list[dict[str, Any]]:
+        return export_rows()
 
     @app.get("/api/export/csv", tags=["compatibility"])
     async def export_csv() -> Response:
         rows = export_rows()
-        headers = sorted({key for row in rows for key in row}) or ["document_id"]
+        headers = sorted({key for row in rows for key in row}) or ["_document_id"]
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=headers)
         writer.writeheader()
@@ -1346,7 +1458,7 @@ def create_app(
     @app.get("/api/export/excel", tags=["compatibility"])
     async def export_excel() -> Response:
         rows = export_rows()
-        headers = sorted({key for row in rows for key in row}) or ["document_id"]
+        headers = sorted({key for row in rows for key in row}) or ["_document_id"]
         workbook = Workbook()
         sheet = workbook.active
         sheet.title = "Insurance Records"
@@ -1361,22 +1473,48 @@ def create_app(
         )
 
     @app.get("/api/v1/documents/{document_id}/export/{export_format}", tags=["documents"])
-    async def proxy_document_export(document_id: str, export_format: str, request: Request):
+    async def export_document(document_id: str, export_format: str):
         document = _record_or_404(store, "document", document_id)
-        upstream_job = document.get("downstream_ids", {}).get("document_job_id")
-        if not upstream_job:
-            raise HTTPException(status_code=409, detail="document processing is not complete")
         if export_format not in {"json", "csv", "excel", "xlsx"}:
             raise HTTPException(status_code=400, detail="unsupported export format")
-        response = await client.request(
-            "document-processing-layer", "GET",
-            f"{configured.document_processing_url}/api/v1/documents/jobs/{upstream_job}/export/{export_format}",
-            correlation_id=request.state.correlation_id,
-        )
+        if not document.get("downstream_ids", {}).get("document_job_id"):
+            raise HTTPException(status_code=409, detail="document processing is not complete")
+        if not document_is_export_ready(document):
+            raise HTTPException(status_code=409, detail="document must be approved before export")
+
+        values = document_field_values(document)
+        disposition = f'attachment; filename="{document_id}.{export_format}"'
+        if export_format == "json":
+            return JSONResponse(
+                content=values,
+                headers={"Content-Disposition": disposition},
+            )
+        if export_format == "csv":
+            output = io.StringIO()
+            headers = sorted(values) or ["field_name"]
+            writer = csv.DictWriter(output, fieldnames=headers)
+            writer.writeheader()
+            if values:
+                writer.writerow(values)
+            return Response(
+                content="\ufeff" + output.getvalue(),
+                media_type="text/csv; charset=utf-8",
+                headers={"Content-Disposition": disposition},
+            )
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Extracted Data"
+        headers = sorted(values) or ["field_name"]
+        sheet.append(headers)
+        if values:
+            sheet.append([values.get(header, "") for header in headers])
+        output = io.BytesIO()
+        workbook.save(output)
         return Response(
-            content=response.content,
-            media_type=response.headers.get("content-type", "application/octet-stream"),
-            headers={"Content-Disposition": response.headers.get("content-disposition", f"attachment; filename={document_id}.{export_format}")},
+            content=output.getvalue(),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": disposition},
         )
 
     return app

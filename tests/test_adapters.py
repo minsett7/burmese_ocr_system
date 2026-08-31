@@ -11,6 +11,7 @@ from adapters.contracts import (
     ImageIdentity,
     build_vlm_contracts,
     normalized_xyxy_to_pixels,
+    repair_template_table_grid,
     semantic_draft_to_template,
     validate_vlm_relationships,
     xywh_to_xyxy,
@@ -384,9 +385,27 @@ def test_relationship_validation_rejects_inconsistent_quality_counts():
 def test_relationship_validation_preserves_table_cell_geometry_and_parentage():
     regions = [
         {"region_id": "table-a", "class_name": "table", "confidence": 1, "bbox_px": [1, 1, 99, 199]},
-        {"region_id": "cell-a", "class_name": "table_cell", "confidence": 1, "bbox_px": [2, 2, 50, 50], "parent_region_id": "table-a"},
+        {
+            "region_id": "cell-a",
+            "class_name": "table_cell",
+            "confidence": 1,
+            "bbox_px": [2, 2, 50, 50],
+            "parent_region_id": "table-a",
+            "row_index": 2,
+            "column_index": 3,
+            "table_cell_order": 7,
+            "detector": "table-cell-model",
+        },
     ]
     ocr, layout, _ = build_vlm_contracts(base_ocr(), base_layout(regions), identity())
+    cell_region = next(
+        region for region in layout["pages"][0]["regions"]
+        if region["region_type"] == "TABLE_CELL"
+    )
+    assert cell_region["row_index"] == 2
+    assert cell_region["column_index"] == 3
+    assert cell_region["table_cell_order"] == 7
+    assert cell_region["detector"] == "table-cell-model"
     result = base_vlm_result(layout)
     result["table_output"] = {
         "document_id": "doc-1",
@@ -443,6 +462,101 @@ def test_semantic_template_mapping_supports_all_document_field_types():
         isinstance(value, int)
         for field in definition["fields"]
         for value in field["bbox"].values()
+    )
+
+
+def test_semantic_template_mapping_publishes_detected_table_cells_as_fields():
+    definition, flags = semantic_draft_to_template(
+        template_id="template_v1",
+        name="Table form",
+        width=200,
+        height=100,
+        regions=[{
+            "id": "region_table",
+            "field_id": "benefits",
+            "label": "Benefits",
+            "extraction_mode": "table",
+            "bbox": {"x": 0.1, "y": 0.1, "width": 0.8, "height": 0.8},
+        }],
+        structural_regions=[
+            {
+                "id": "cell_b",
+                "region_type": "TABLE_CELL",
+                "parent_region_id": "region_table",
+                "row_index": 0,
+                "column_index": 1,
+                "table_cell_order": 1,
+                "bbox": {"x": 0.5, "y": 0.1, "width": 0.4, "height": 0.4},
+            },
+            {
+                "id": "cell_a",
+                "region_type": "TABLE_CELL",
+                "parent_region_id": "region_table",
+                "row_index": 0,
+                "column_index": 0,
+                "table_cell_order": 0,
+                "bbox": {"x": 0.1, "y": 0.1, "width": 0.4, "height": 0.4},
+            },
+        ],
+    )
+
+    assert flags == []
+    assert [field["id"] for field in definition["fields"]] == [
+        "field_cell_a", "field_cell_b",
+    ]
+    assert all(field["field_type"] == "printed_text" for field in definition["fields"])
+    assert [field["table_column_index"] for field in definition["fields"]] == [0, 1]
+    assert all(
+        field["table_parent_field_id"] == "field_benefits"
+        for field in definition["fields"]
+    )
+
+
+def test_semantic_template_mapping_keeps_legacy_whole_table_without_cells():
+    definition, flags = semantic_draft_to_template(
+        template_id="template_v1",
+        name="Legacy table form",
+        width=200,
+        height=100,
+        regions=[{
+            "id": "region_table",
+            "field_id": "benefits",
+            "label": "Benefits",
+            "extraction_mode": "table",
+            "bbox": {"x": 0.1, "y": 0.1, "width": 0.8, "height": 0.8},
+        }],
+    )
+
+    assert flags == []
+    assert len(definition["fields"]) == 1
+    assert definition["fields"][0]["field_type"] == "table"
+
+
+def test_repair_template_table_grid_recovers_collapsed_cell_positions():
+    fields = []
+    for index, (x, y) in enumerate(((10, 10), (110, 10), (10, 60), (110, 60))):
+        fields.append({
+            "id": f"cell_{index}",
+            "label": "Benefits row 1, column 1",
+            "field_type": "printed_text",
+            "bbox": {"x": x, "y": y, "width": 90, "height": 40},
+            "table_parent_field_id": "field_benefits",
+            "table_parent_label": "Benefits",
+            "table_row_index": 0,
+            "table_column_index": 0,
+            "table_cell_order": index,
+        })
+
+    repaired = repair_template_table_grid({"fields": fields})
+
+    assert [
+        (field["table_row_index"], field["table_column_index"])
+        for field in repaired["fields"]
+    ] == [(0, 0), (0, 1), (1, 0), (1, 1)]
+    assert repaired["fields"][3]["label"] == "Benefits row 2, column 2"
+    assert all(
+        field["table_row_index"] == 0 and field["table_column_index"] == 0
+        for field in fields
     )
 
 

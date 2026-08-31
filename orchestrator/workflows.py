@@ -16,6 +16,7 @@ from adapters.contracts import (
     ImageIdentity,
     VLM_FIELD_TYPES,
     build_vlm_contracts,
+    repair_template_table_grid,
     semantic_draft_to_template,
     validate_vlm_relationships,
     xyxy_to_normalized_xywh,
@@ -694,6 +695,12 @@ class WorkflowService:
                 "page": page_number,
                 "region_type": region["region_type"],
                 "parent_region_id": region.get("parent_region_id"),
+                "row_index": region.get("row_index"),
+                "column_index": region.get("column_index"),
+                "table_cell_order": region.get("table_cell_order"),
+                "is_header": bool(region.get("is_header", False)),
+                "confidence": region.get("confidence"),
+                "detector": region.get("detector"),
                 "bbox": xyxy_to_normalized_xywh(
                     region["bbox_px"], identity["width"], identity["height"]
                 ),
@@ -888,6 +895,7 @@ class WorkflowService:
             width=identity["width"],
             height=identity["height"],
             regions=record["draft"]["regions"],
+            structural_regions=record["draft"].get("structural_regions", []),
             page_dimensions=(
                 [
                     {
@@ -990,7 +998,7 @@ class WorkflowService:
             await self.client.request(
                 "document-processing-layer", "POST",
                 f"{self.settings.document_processing_url}/api/v1/templates/register",
-                correlation_id=correlation_id, json=definition,
+                correlation_id=correlation_id, json=repair_template_table_grid(definition),
             )
             reference_paths = version.get("reference_image_paths") or [version.get("reference_image_path")]
             expected_pages = int(template.get("pages") or 1)
@@ -1244,7 +1252,7 @@ class WorkflowService:
                 "POST",
                 f"{self.settings.document_processing_url}/api/v1/templates/register",
                 correlation_id=correlation_id,
-                json=definition,
+                json=repair_template_table_grid(definition),
             )
             reference_image_paths = template_version.get("reference_image_paths") or [
                 template_version.get("reference_image_path")
@@ -1367,6 +1375,15 @@ class WorkflowService:
                 "input_field": key,
                 "label": item.get("label", key.replace("_", " ").title()),
                 "page": int(item.get("page") or 1),
+                "table_parent_field_id": item.get("table_parent_field_id"),
+                "table_parent_label": item.get("table_parent_label"),
+                "table_row_index": item.get("table_row_index"),
+                "table_column_index": item.get("table_column_index"),
+                "table_cell_order": item.get("table_cell_order"),
+                "table_is_header": bool(item.get("table_is_header", False)),
+                "table_is_empty": item.get("table_is_empty"),
+                "table_change_ratio": item.get("table_change_ratio"),
+                "reference_difference_path": item.get("reference_difference_path"),
             }
             if item.get("human_review_flag", False):
                 review_fields.append(key)
@@ -1380,6 +1397,7 @@ class WorkflowService:
                 "page_count": int(upstream.get("page_count") or 1),
                 "page_alignment_scores": upstream.get("page_alignment_scores") or {},
                 "aligned_page_count": len(upstream.get("aligned_page_paths") or {}),
+                "tables": upstream.get("tables") or [],
             },
             "original_upstream_result": upstream,
         }

@@ -29,7 +29,13 @@ services:
       DEVICE: cpu
       BLUR_LAPLACIAN_THRESHOLD: ${BLUR_LAPLACIAN_THRESHOLD:-100}
       CONFIDENCE_THRESHOLD: ${DOCUMENT_CONFIDENCE_THRESHOLD:-0.80}
+      TABLE_CELL_DELTA_THRESHOLD: ${TABLE_CELL_DELTA_THRESHOLD:-32}
+      TABLE_CELL_MIN_CHANGE_RATIO: ${TABLE_CELL_MIN_CHANGE_RATIO:-0.0015}
+      TABLE_CELL_BORDER_MARGIN_RATIO: ${TABLE_CELL_BORDER_MARGIN_RATIO:-0.03}
       LLM_POST_CORRECTION_ENABLED: ${LLM_POST_CORRECTION_ENABLED:-false}
+      TABLE_CELL_INK_THRESHOLD: ${TABLE_CELL_INK_THRESHOLD:-180}
+      TABLE_CELL_REFERENCE_CONTENT_RATIO: ${TABLE_CELL_REFERENCE_CONTENT_RATIO:-0.004}
+      TABLE_CELL_HEADER_DARK_RATIO: ${TABLE_CELL_HEADER_DARK_RATIO:-0.55}
       LLM_POST_CORRECTION_URL: ${LLM_POST_CORRECTION_URL:-http://insurance-vlm:8000}
       LLM_POST_CORRECTION_API_KEY: ${VLM_API_KEY:-local-vlm-key}
       LLM_POST_CORRECTION_TIMEOUT_SECONDS: ${LLM_POST_CORRECTION_TIMEOUT_SECONDS:-180}
@@ -40,6 +46,7 @@ services:
       - ./runtime/document-crops:/app/storage/crops
       - ./runtime/document-preprocessed-crops:/app/storage/preprocessed_crops
       - ./runtime/document-line-crops:/app/storage/line_crops
+      - ./runtime/document-table-cell-differences:/app/storage/table_cell_differences
       - ${DOCUMENT_MODEL_SOURCE:-./services/document-processing-layer/models_weights}:/app/models_weights:ro
     ports:
       - "8001:8000"

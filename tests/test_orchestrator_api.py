@@ -12,7 +12,7 @@ from PIL import Image
 
 from orchestrator.config import Settings
 from orchestrator.database import create_session_factory
-from orchestrator.main import create_app
+from orchestrator.main import create_app, exported_field_key, template_field_key_map, template_layout_regions
 from orchestrator.workflows import WorkflowService
 
 
@@ -20,6 +20,59 @@ def png_bytes() -> bytes:
     output = io.BytesIO()
     Image.new("RGB", (100, 200), "white").save(output, format="PNG")
     return output.getvalue()
+
+
+def test_template_layout_regions_include_generated_table_cells():
+    version = {
+        "draft_snapshot": {
+            "pages": [
+                {"page_number": 1, "width": 100, "height": 200},
+                {"page_number": 2, "width": 200, "height": 400},
+            ],
+            "regions": [
+                {"id": "name", "field_id": "field_name", "key": "name", "region_type": "TEXT_INPUT_BOX"},
+                {"id": "table", "field_id": "field_claim_details", "key": "claim_details", "region_type": "TABLE"},
+            ],
+        },
+        "definition": {
+            "fields": [
+                {
+                    "id": "field_table_cell_0001",
+                    "label": "Claim details row 1, column 1",
+                    "page": 2,
+                    "bbox": {"x": 20, "y": 80, "width": 60, "height": 40},
+                    "table_parent_field_id": "field_claim_details",
+                    "table_parent_label": "Claim details",
+                    "table_row_index": 0,
+                    "table_column_index": 0,
+                    "table_cell_order": 0,
+                    "table_is_header": True,
+                },
+            ],
+        },
+    }
+
+    regions = template_layout_regions(version)
+
+    cell = next(item for item in regions if item.get("region_type") == "TABLE_CELL")
+    assert cell["key"] == "field_table_cell_0001"
+    assert cell["page"] == 2
+    assert cell["bbox"] == {"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.1}
+    assert cell["table_parent_field_id"] == "field_claim_details"
+    assert cell["table_is_header"] is True
+    keys = template_field_key_map(version)
+    assert keys["field_name"] == "name"
+    assert keys["field_table_cell_0001"] == "claim_details_r1_c1"
+
+    assert exported_field_key(
+        "field_table_cell_0001",
+        {
+            "table_parent_field_id": "field_claim_details",
+            "table_row_index": 1,
+            "table_column_index": 2,
+        },
+        keys,
+    ) == "claim_details_r2_c3"
 
 
 def test_plain_postgresql_url_uses_installed_psycopg3_driver():
@@ -519,6 +572,9 @@ def test_document_workflow_review_approval_and_real_exports(client):
     canonical = test_client.get(f"/api/v1/documents/{document_id}").json()
     assert canonical["status"] == "needs_review"
     assert canonical["processed"]["fields"]["field_policy"]["raw_value"] == "MTR 123"
+    assert test_client.get("/api/export/json").json() == []
+    unapproved_export = test_client.get(f"/api/v1/documents/{document_id}/export/json")
+    assert unapproved_export.status_code == 409
     review = test_client.put(
         f"/api/v1/documents/{document_id}/review",
         json={"reviewer": "alice", "fields": [{"field_id": "field_policy", "corrected_value": "MTR124", "reason": "scan correction"}]},
@@ -544,11 +600,15 @@ def test_document_workflow_review_approval_and_real_exports(client):
     assert synced.status_code == 200
     assert synced.json()["status"] == "synced"
     assert synced.json()["sync_status"] == "synced"
+    json_export = test_client.get("/api/export/json")
+    assert json_export.status_code == 200
+    assert json_export.json()[0]["_document_id"] == document_id
+    assert json_export.json()[0]["policy"] == "MTR124"
     export = test_client.get("/api/export/csv")
     assert export.status_code == 200
     assert "MTR124" in export.text
-    upstream_export = test_client.get(f"/api/v1/documents/{document_id}/export/json")
-    assert upstream_export.content == b"export"
+    document_export = test_client.get(f"/api/v1/documents/{document_id}/export/json")
+    assert document_export.json() == {"policy": "MTR124"}
     assert fake.processed_documents == 1
     assert len(fake.registered_templates) == 1
 

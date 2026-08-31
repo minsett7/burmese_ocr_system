@@ -5,6 +5,7 @@ import io
 import math
 import re
 import unicodedata
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -382,6 +383,14 @@ def build_vlm_contracts(
             ),
             "parent_region_id": parent_id,
         }
+        if region_type == "TABLE_CELL":
+            for metadata_key in ("row_index", "column_index", "table_cell_order"):
+                if source.get(metadata_key) is not None:
+                    region[metadata_key] = _nonnegative_integer(
+                        source[metadata_key], f"{region_id} {metadata_key}"
+                    )
+            if source.get("detector") is not None:
+                region["detector"] = str(source["detector"])
         if source.get("polygon_px") is not None:
             region["polygon_px"] = _validate_polygon(
                 source["polygon_px"], identity.width, identity.height, f"{region_id} polygon"
@@ -825,6 +834,92 @@ EXTRACTION_MODES = {
 }
 
 
+def _cluster_axis(values: list[float], tolerance: float) -> list[int]:
+    clusters: list[list[tuple[int, float]]] = []
+    for original_index, value in sorted(enumerate(values), key=lambda item: item[1]):
+        if not clusters:
+            clusters.append([(original_index, value)])
+            continue
+        center = sum(item[1] for item in clusters[-1]) / len(clusters[-1])
+        if abs(value - center) <= tolerance:
+            clusters[-1].append((original_index, value))
+        else:
+            clusters.append([(original_index, value)])
+    assignments = [0] * len(values)
+    for cluster_index, cluster in enumerate(clusters):
+        for original_index, _ in cluster:
+            assignments[original_index] = cluster_index
+    return assignments
+
+
+def repair_template_table_grid(definition: dict[str, Any]) -> dict[str, Any]:
+    """Recover collapsed/missing cell indices from immutable template geometry."""
+    repaired = deepcopy(definition)
+    fields = repaired.get("fields")
+    if not isinstance(fields, list):
+        return repaired
+    groups: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for field in fields:
+        if not isinstance(field, dict) or not field.get("table_parent_field_id"):
+            continue
+        groups.setdefault(
+            (str(field["table_parent_field_id"]), int(field.get("page") or 1)), []
+        ).append(field)
+
+    for members in groups.values():
+        positions = [
+            (field.get("table_row_index"), field.get("table_column_index"))
+            for field in members
+        ]
+        complete_unique_grid = (
+            all(
+                isinstance(row, int) and row >= 0
+                and isinstance(column, int) and column >= 0
+                for row, column in positions
+            )
+            and len(set(positions)) == len(positions)
+        )
+        if complete_unique_grid:
+            continue
+        if any(not isinstance(field.get("bbox"), dict) for field in members):
+            continue
+        widths = [float(field["bbox"].get("width") or 1) for field in members]
+        heights = [float(field["bbox"].get("height") or 1) for field in members]
+        median_width = sorted(widths)[len(widths) // 2]
+        median_height = sorted(heights)[len(heights) // 2]
+        rows = _cluster_axis(
+            [float(field["bbox"].get("y") or 0) for field in members],
+            max(3.0, median_height * 0.42),
+        )
+        columns = _cluster_axis(
+            [float(field["bbox"].get("x") or 0) for field in members],
+            max(3.0, median_width * 0.42),
+        )
+        ordered = sorted(
+            range(len(members)),
+            key=lambda index: (
+                rows[index],
+                columns[index],
+                float(members[index]["bbox"].get("y") or 0),
+                float(members[index]["bbox"].get("x") or 0),
+            ),
+        )
+        order_by_index = {
+            member_index: order for order, member_index in enumerate(ordered)
+        }
+        for index, field in enumerate(members):
+            field["table_row_index"] = rows[index]
+            field["table_column_index"] = columns[index]
+            field["table_cell_order"] = order_by_index[index]
+            parent_label = field.get("table_parent_label")
+            if parent_label:
+                field["label"] = (
+                    f"{parent_label} row {rows[index] + 1}, "
+                    f"column {columns[index] + 1}"
+                )
+    return repaired
+
+
 def semantic_draft_to_template(
     *,
     template_id: str,
@@ -832,6 +927,7 @@ def semantic_draft_to_template(
     width: int,
     height: int,
     regions: list[dict[str, Any]],
+    structural_regions: list[dict[str, Any]] | None = None,
     page_dimensions: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Convert a human-approved editable draft into document-processing format."""
@@ -856,6 +952,20 @@ def semantic_draft_to_template(
     fields: list[dict[str, Any]] = []
     review_flags: list[str] = []
     seen: set[str] = set()
+    table_cells_by_parent: dict[str, list[dict[str, Any]]] = {}
+    for cell in structural_regions or []:
+        if str(cell.get("region_type") or "").upper() != "TABLE_CELL":
+            continue
+        parent_id = cell.get("parent_region_id")
+        if parent_id:
+            table_cells_by_parent.setdefault(str(parent_id), []).append(cell)
+    for cells in table_cells_by_parent.values():
+        cells.sort(key=lambda item: (
+            int(item.get("table_cell_order") or 0),
+            int(item.get("row_index") or 0),
+            int(item.get("column_index") or 0),
+            str(item.get("id") or ""),
+        ))
     for index, region in enumerate(regions, 1):
         if region.get("enabled", True) is False:
             continue
@@ -876,6 +986,49 @@ def semantic_draft_to_template(
         mapped = EXTRACTION_MODES.get(requested_type) or VLM_FIELD_TYPES.get(requested_type)
         if mapped is None:
             review_flags.append(f"{field_id}: unsupported field type {requested_type!r}")
+            continue
+        table_cells = table_cells_by_parent.get(str(region.get("id")), []) if mapped == "table" else []
+        if table_cells:
+            parent_label = str(region.get("label") or region.get("key") or field_id)
+            for cell_index, cell in enumerate(table_cells, 1):
+                cell_field_id = _safe_id(
+                    "field_", cell.get("id") or f"{field_id}_cell_{cell_index:03d}", cell_index
+                )
+                if cell_field_id in seen:
+                    raise AdapterError(f"duplicate template field ID: {cell_field_id}")
+                cell_bbox = cell.get("bbox")
+                if not isinstance(cell_bbox, dict):
+                    raise AdapterError(f"{cell_field_id} is missing editable bbox geometry")
+                try:
+                    cell_page = int(cell.get("page", page_number))
+                    cell_page_width, cell_page_height = dimensions_by_page[cell_page]
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise AdapterError(f"{cell_field_id} references an unknown template page") from exc
+                cell_box_px = normalized_xywh_to_xyxy(
+                    cell_bbox, cell_page_width, cell_page_height
+                )
+                row_index = int(cell.get("row_index") or 0)
+                column_index = int(cell.get("column_index") or 0)
+                cell_field = {
+                    "id": cell_field_id,
+                    "label": f"{parent_label} row {row_index + 1}, column {column_index + 1}",
+                    "field_type": "printed_text",
+                    "bbox": xyxy_to_integer_xywh(
+                        cell_box_px, cell_page_width, cell_page_height
+                    ),
+                    "required": False,
+                    "validation_regex": None,
+                    "table_parent_field_id": field_id,
+                    "table_parent_label": parent_label,
+                    "table_row_index": row_index,
+                    "table_column_index": column_index,
+                    "table_cell_order": int(cell.get("table_cell_order") or cell_index - 1),
+                    "table_is_header": bool(cell.get("is_header", False)),
+                }
+                if multi_page:
+                    cell_field["page"] = cell_page
+                fields.append(cell_field)
+                seen.add(cell_field_id)
             continue
         field = {
                 "id": field_id,
@@ -911,4 +1064,4 @@ def semantic_draft_to_template(
             }
             for page_number, dimensions in sorted(dimensions_by_page.items())
         ]
-    return definition, review_flags
+    return repair_template_table_grid(definition), review_flags
